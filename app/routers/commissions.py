@@ -33,6 +33,7 @@ def _row(r) -> Commission:
         cwd=r["cwd"] if "cwd" in keys else None,
         session_id=r["session_id"] if "session_id" in keys else None,
         rounds=r["rounds"] or 0 if "rounds" in keys else 0,
+        model=r["model"] if "model" in keys else None,
     )
 
 
@@ -54,8 +55,8 @@ def create_commission(body: CommissionPost) -> Commission:
     if not title:
         raise HTTPException(status_code=400, detail="委託標題不可空白")
     cid = db.add_commission(body.guild, title, body.note)
-    if body.goal or body.cwd:
-        db.update_commission(cid, goal=body.goal, cwd=body.cwd)
+    if body.goal or body.cwd or body.model:
+        db.update_commission(cid, goal=body.goal, cwd=body.cwd, model=body.model)
     return _get(cid)
 
 
@@ -86,6 +87,8 @@ async def dispatch_commission(cid: int, body: DispatchReq) -> Commission:
         db.update_commission(cid, cwd=body.cwd)
     elif not c.cwd:
         raise HTTPException(status_code=400, detail="請先指定工作資料夾(公會)")
+    if body.model is not None:
+        db.update_commission(cid, model=body.model or None)
     task = asyncio.create_task(dispatch.run_dispatch(cid))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)

@@ -248,6 +248,7 @@ class CommissionPost(BaseModel):
     note: str | None = None
     goal: str | None = None  # 明確目標(可中途修改);未填時派遣以 title 為目標
     cwd: str | None = None  # 派遣時的工作資料夾(公會路徑)
+    model: str | None = None  # 冒險者位階(模型 id;空 = 跟隨 CLI 預設)
 
 
 # open(招募中)/ working(派遣執行中)/ blocked(受阻等指示)/ failed / done
@@ -269,21 +270,24 @@ class Commission(BaseModel):
     cwd: str | None = None
     session_id: str | None = None  # headless 冒險者的 session(可續冒險)
     rounds: int = 0
+    model: str | None = None  # 冒險者位階(派遣模型)
 
 
 class CommissionPatch(BaseModel):
-    """中途調整委託:改目標 / 標題 / 備註 / 工作資料夾。"""
+    """中途調整委託:改目標 / 標題 / 備註 / 工作資料夾 / 位階。"""
 
     goal: str | None = None
     title: str | None = None
     note: str | None = None
     cwd: str | None = None
+    model: str | None = None
 
 
 class DispatchReq(BaseModel):
     """派遣一位 headless 冒險者去執行委託。"""
 
     cwd: str | None = None  # 未填則用委託上的 cwd
+    model: str | None = None  # 本次派遣的位階;未填則用委託上的 model
 
 
 class SteerPost(BaseModel):

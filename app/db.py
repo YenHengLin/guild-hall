@@ -141,6 +141,8 @@ def _migrate() -> None:
             ("rounds", "ALTER TABLE commissions ADD COLUMN rounds INTEGER DEFAULT 0"),
             ("stop_requested",
              "ALTER TABLE commissions ADD COLUMN stop_requested INTEGER DEFAULT 0"),
+            # 冒險者位階:派遣時用的模型(空 = 跟隨 CLI 預設)
+            ("model", "ALTER TABLE commissions ADD COLUMN model TEXT"),
         ]:
             if col not in ccols:
                 c.execute(ddl)

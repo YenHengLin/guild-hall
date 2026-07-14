@@ -1,7 +1,7 @@
 <script setup>
 import { computed, ref, watch, onUnmounted } from 'vue'
 import { useGuildStore } from '../stores/guild'
-import { statusMeta, relativeTime } from '../labels'
+import { statusMeta, relativeTime, RANKS, rankOf } from '../labels'
 
 const props = defineProps({
   quests: { type: Array, default: () => [] }, // session 自動衍生(進行中)
@@ -28,6 +28,7 @@ const title = ref('')
 const note = ref('')
 const goal = ref('')
 const formGuild = ref('') // guild path,派遣工作資料夾
+const formModel = ref('') // 冒險者位階(派遣模型)
 async function post() {
   if (!title.value.trim()) return
   const g = store.guilds.find((x) => x.path === formGuild.value)
@@ -37,6 +38,7 @@ async function post() {
     goal: goal.value || null,
     guild: g?.name || null,
     cwd: formGuild.value || null,
+    model: formModel.value || null,
   })
   if (ok) {
     title.value = ''; note.value = ''; goal.value = ''
@@ -62,6 +64,7 @@ function toggleExpand(c) {
   if (expandedId.value === c.id) { expandedId.value = null; return }
   expandedId.value = c.id
   goalEdit.value = c.goal || c.title
+  dispatchModel.value = c.model || ''
   editingGoal.value = false
   events.value = []
   refreshEvents()
@@ -78,12 +81,14 @@ const expanded = computed(() =>
 
 // 派遣需要工作資料夾:未設定時先讓使用者選公會
 const dispatchCwd = ref('')
+const dispatchModel = ref('') // 本次派遣位階;展開時帶入委託現值
 async function doDispatch(c) {
   actionErr.value = null
   const cwd = c.cwd || dispatchCwd.value
   if (!cwd) { actionErr.value = '請先選擇要在哪個公會(資料夾)執行'; return }
-  if (!confirm(`派遣 headless 冒險者執行「${c.title}」?\n會實際跑 Claude、花 token,並可能修改 ${cwd} 內的檔案。`)) return
-  actionErr.value = await store.dispatch(c.id, cwd)
+  const rank = rankOf(dispatchModel.value)
+  if (!confirm(`派遣${rank.short}冒險者執行「${c.title}」?\n會實際跑 Claude、花 token,並可能修改 ${cwd} 內的檔案。`)) return
+  actionErr.value = await store.dispatch(c.id, cwd, dispatchModel.value)
   refreshEvents()
 }
 async function doSteer(c) {
@@ -120,6 +125,9 @@ async function saveGoal(c) {
           🏰 {{ g.name }}
         </option>
       </select>
+      <select v-model="formModel" title="冒險者位階:派遣時用哪個模型">
+        <option v-for="r in RANKS" :key="r.value" :value="r.value">{{ r.label }}</option>
+      </select>
       <button class="btn-primary" @click="post">釘上布告欄</button>
     </div>
 
@@ -132,7 +140,7 @@ async function saveGoal(c) {
           <span class="quest__emoji">{{ COMMISSION_META[c.status].emoji }}</span>
           <span class="quest__text">{{ c.title }}</span>
           <span class="quest__guild">
-            {{ COMMISSION_META[c.status].label }}
+            {{ rankOf(c.model).short }} {{ COMMISSION_META[c.status].label }}
             <template v-if="c.rounds"> · 第{{ c.rounds }}回合</template>
           </span>
         </button>
@@ -168,9 +176,14 @@ async function saveGoal(c) {
           <div class="dispatch__actions">
             <button v-if="c.status === 'working'" class="btn-ghost"
                     @click="store.stopDispatch(c.id)">⏹ 停止派遣</button>
-            <button v-else class="btn-primary" @click="doDispatch(c)">
-              🚀 再派遣(續同一位冒險者)
-            </button>
+            <template v-else>
+              <select v-model="dispatchModel" title="冒險者位階">
+                <option v-for="r in RANKS" :key="r.value" :value="r.value">{{ r.label }}</option>
+              </select>
+              <button class="btn-primary" @click="doDispatch(c)">
+                🚀 再派遣(續同一位冒險者)
+              </button>
+            </template>
           </div>
           <div v-if="actionErr" class="dispatch__err">⚠️ {{ actionErr }}</div>
         </div>
@@ -213,6 +226,9 @@ async function saveGoal(c) {
               </option>
             </select>
             <span v-else class="dispatch__cwd" :title="c.cwd">🏰 {{ c.guild || c.cwd }}</span>
+            <select v-model="dispatchModel" title="冒險者位階:派遣時用哪個模型">
+              <option v-for="r in RANKS" :key="r.value" :value="r.value">{{ r.label }}</option>
+            </select>
             <button class="btn-primary" @click="doDispatch(c)">🚀 派遣冒險者</button>
             <button class="btn-ghost" @click="store.toggleCommission(c)">✅ 標記完成</button>
           </div>

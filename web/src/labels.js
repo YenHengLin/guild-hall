@@ -101,3 +101,15 @@ export function classOf(adventurer) {
   }
   return { icon: '🗡️', klass: '冒險者' }
 }
+
+// 冒險者位階:派遣時用的模型(強弱 vs 花費的取捨)
+export const RANKS = [
+  { value: '', label: '⭐ 預設位階(跟隨 CLI 設定)', short: '⭐' },
+  { value: 'claude-haiku-4-5-20251001', label: '🥉 銅牌冒險者(haiku,快又省)', short: '🥉' },
+  { value: 'claude-sonnet-4-6', label: '🥈 銀牌冒險者(sonnet,均衡)', short: '🥈' },
+  { value: 'claude-opus-4-8', label: '🥇 金牌冒險者(opus,最強最貴)', short: '🥇' },
+]
+export function rankOf(model) {
+  return RANKS.find((r) => r.value === (model || '')) ||
+    { value: model, label: model, short: '❓' }
+}

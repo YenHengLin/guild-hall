@@ -87,6 +87,8 @@ npm run dev
 - **回合之間**櫃台會注入你最新的目標(✏️ 調整)與中途指示(🗣 steer)→ **中途調整任務方向**
 - `DONE` 時自動把 `REPORT` 送進櫃台佇列(→ wiki 歸檔 + 深度合成),委託自動標記完成 → 閉環
 - `BLOCKED` / 回合用盡時暫停,下指示後可「再派遣」續同一位冒險者(同 session)
+- **冒險者位階**:每張委託可選派遣模型 —— 🥉銅牌(haiku,快省)/🥈銀牌(sonnet)/
+  🥇金牌(opus,最強);未選則跟隨 `GUILD_DISPATCH_MODEL` → CLI 預設
 - 護欄:一次一個派遣、回合上限(`GUILD_DISPATCH_ROUNDS`,預設 6)、單回合逾時
   (`GUILD_DISPATCH_TIMEOUT`,預設 600s)、工具白名單(`GUILD_DISPATCH_TOOLS`)、
   模型可換(`GUILD_DISPATCH_MODEL`)

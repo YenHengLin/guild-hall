@@ -37,8 +37,9 @@ export const deleteCommission = (id) => http.delete(`/commissions/${id}`).then((
 // ── 派遣系統(headless 冒險者回合制執行委託)──
 export const patchCommission = (id, payload) =>
   http.patch(`/commissions/${id}`, payload).then((r) => r.data)
-export const dispatchCommission = (id, cwd) =>
-  http.post(`/commissions/${id}/dispatch`, { cwd: cwd || null }).then((r) => r.data)
+export const dispatchCommission = (id, cwd, model) =>
+  http.post(`/commissions/${id}/dispatch`,
+    { cwd: cwd || null, model: model ?? null }).then((r) => r.data)
 export const steerCommission = (id, content) =>
   http.post(`/commissions/${id}/steer`, { content }).then((r) => r.data)
 export const stopCommission = (id) => http.post(`/commissions/${id}/stop`).then((r) => r.data)

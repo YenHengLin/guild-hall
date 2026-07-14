@@ -117,8 +117,11 @@ def _run_round(cmd: list[str], cwd: str | None, prompt: str) -> dict:
     return {"ok": True, "text": text, "session_id": sid, "cost": cost}
 
 
-def _build_cmd(resume_sid: str | None) -> list[str]:
-    """組 claude 指令(不含 prompt;prompt 由 stdin 餵入)。"""
+def _build_cmd(resume_sid: str | None, model: str | None = None) -> list[str]:
+    """組 claude 指令(不含 prompt;prompt 由 stdin 餵入)。
+
+    model = 冒險者位階:委託自帶 > 全域 env > CLI 預設。
+    """
     cmd = [CLAUDE, "-p"]
     if resume_sid:
         cmd += ["-r", resume_sid]
@@ -128,8 +131,9 @@ def _build_cmd(resume_sid: str | None) -> list[str]:
         "--allowedTools", TOOLS,
         "--permission-mode", "acceptEdits",
     ]
-    if MODEL:
-        cmd += ["--model", MODEL]
+    chosen = model or MODEL
+    if chosen:
+        cmd += ["--model", chosen]
     return cmd
 
 
@@ -174,7 +178,9 @@ async def _loop(cid: int) -> None:
         return
     cwd = row["cwd"] or None
     db.update_commission(cid, status="working", stop_requested=0)
-    db.add_event(cid, "system", f"🚀 派遣啟動(資料夾:{cwd or '預設'})")
+    db.add_event(cid, "system",
+                 f"🚀 派遣啟動(資料夾:{cwd or '預設'},"
+                 f"位階:{row['model'] or MODEL or 'CLI 預設'})")
 
     sid = row["session_id"]  # 之前派過可續冒險
     total_cost = 0.0
@@ -201,7 +207,8 @@ async def _loop(cid: int) -> None:
 
         log.info("委託 #%s 回合 %s/%s 開始 (sid=%s)", cid, rnd, MAX_ROUNDS,
                  (sid or "new")[:8])
-        res = await asyncio.to_thread(_run_round, _build_cmd(sid), cwd, prompt)
+        res = await asyncio.to_thread(
+            _run_round, _build_cmd(sid, row["model"]), cwd, prompt)
 
         if not res["ok"]:
             db.update_commission(cid, status="failed", rounds=rnd)

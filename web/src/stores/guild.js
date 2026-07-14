@@ -129,9 +129,9 @@ export const useGuildStore = defineStore('guild', {
       this.commissions = await fetchCommissions()
     },
     // ── 派遣系統 ──
-    async dispatch(id, cwd) {
+    async dispatch(id, cwd, model) {
       try {
-        await dispatchCommission(id, cwd)
+        await dispatchCommission(id, cwd, model)
         this.commissions = await fetchCommissions()
         return null
       } catch (e) {
