@@ -1,0 +1,5 @@
+guild.db*
+__pycache__/
+node_modules/
+web/dist/
+.pytest_cache/
