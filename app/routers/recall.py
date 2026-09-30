@@ -26,6 +26,24 @@ router = APIRouter(prefix="/api/recall", tags=["recall"])
 _stream_busy = threading.Lock()
 
 
+def _resolve_or_404(sid: str) -> tuple[str, str | None]:
+    """找 session 的真實工作目錄;找不到就明確報錯(而非開個必定失敗的終端)。
+
+    `claude --resume <id>` 只在「該 id 的 jsonl 存在於某個 project 目錄」時才成功。
+    若 id 打錯一個字、或那是別處的 headless session 沒被掃到,session_location
+    會回 (None, None) —— 此時直接回 404,前端就不會看到 claude CLI 那句
+    看不懂的「No conversation found with session ID」。
+    """
+    cwd, guild = scanner.session_location(sid)
+    if cwd is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"找不到 session {sid[:12]}… 的紀錄(這個 id 可能打錯了,"
+                    f"或該對話不在已掃描的公會目錄裡)。請確認 session id 正確。"),
+        )
+    return cwd, guild
+
+
 def _title_from(text: str) -> str:
     for line in (text or "").splitlines():
         s = line.strip().lstrip("#*-0123456789. )").strip()
@@ -34,36 +52,19 @@ def _title_from(text: str) -> str:
     return "召回回報"
 
 
-@router.post("/report")
-async def recall_report(body: RecallReq) -> dict:
-    """復活該 session,請它自己寫一份完整結案回報,並交給櫃台歸檔。"""
-    cwd, guild = scanner.session_location(body.adventurer_id)
-    res = await recall.recall(body.adventurer_id, recall.REPORT_PROMPT, cwd,
-                              read_only=True, cheap=True)
-    if not res["ok"]:
-        raise HTTPException(status_code=502, detail=res["error"])
-
-    text = res["result"] or ""
-    rid = db.enqueue(
-        adventurer_id=body.adventurer_id, guild=guild,
-        title=_title_from(text), summary=text,
-        files_changed=json.dumps([], ensure_ascii=False),
-        lessons=None, outcome="success",
-    )
-    return {"ok": True, "result": text, "cost": res.get("cost"),
-            "report_id": rid, "filed": True}
-
-
 @router.post("/ask")
 async def recall_ask(body: RecallAsk) -> dict:
     """復活該 session,帶著完整脈絡回答使用者的追問(不歸檔)。"""
     if not body.question.strip():
         raise HTTPException(status_code=400, detail="問題不可空白")
-    cwd, _ = scanner.session_location(body.adventurer_id)
+    cwd, _ = _resolve_or_404(body.adventurer_id)
     res = await recall.recall(body.adventurer_id, body.question, cwd,
                               read_only=True, cheap=False)
     if not res["ok"]:
         raise HTTPException(status_code=502, detail=res["error"])
+    if res.get("cost"):
+        db.add_cost("recall", float(res["cost"]), adventurer_id=body.adventurer_id,
+                    detail="召回答詢")
     return {"ok": True, "result": res["result"], "cost": res.get("cost")}
 
 
@@ -83,7 +84,7 @@ async def recall_stream(
     if _stream_busy.locked():
         raise HTTPException(status_code=409, detail="已有一個即時串流進行中,請稍候")
 
-    cwd, guild = scanner.session_location(adventurer_id)
+    cwd, guild = _resolve_or_404(adventurer_id)
     if mode == "fix":
         instr = (prompt or "").strip()
         if not instr:
@@ -102,12 +103,31 @@ async def recall_stream(
     _SENTINEL = {"kind": "end"}
 
     def produce() -> None:
+        final_text, final_cost = "", None
         with _stream_busy:
             try:
                 for ev in stream_recall.stream_events(
                     adventurer_id, run_prompt, cwd, read_only=read_only, cheap=cheap
                 ):
+                    if ev.get("kind") == "done":
+                        final_text = ev.get("text") or final_text
+                        final_cost = ev.get("cost")
                     loop.call_soon_threadsafe(q.put_nowait, ev)
+                # report 模式:串流結束後自動歸檔進櫃台(= 舊「請他回報」的沉澱能力,
+                # 現在併進串流:你看它一步步做,做完成果照樣寫進 wiki 知識庫)。
+                if mode == "report" and final_text.strip():
+                    if final_cost:
+                        db.add_cost("recall", float(final_cost),
+                                    adventurer_id=adventurer_id, guild=guild,
+                                    model=stream_recall.CHEAP_MODEL, detail="召回回報")
+                    rid = db.enqueue(
+                        adventurer_id=adventurer_id, guild=guild,
+                        title=_title_from(final_text), summary=final_text,
+                        files_changed=json.dumps([], ensure_ascii=False),
+                        lessons=None, outcome="success",
+                    )
+                    loop.call_soon_threadsafe(
+                        q.put_nowait, {"kind": "filed", "report_id": rid})
             except Exception as exc:  # noqa: BLE001 — 串流要善終
                 loop.call_soon_threadsafe(
                     q.put_nowait, {"kind": "error", "text": str(exc)})
@@ -140,7 +160,7 @@ def recall_continue(body: RecallReq) -> dict:
     """開一個互動終端,resume 該 session,讓使用者親自接續做事。"""
     if not recall.available():
         raise HTTPException(status_code=502, detail="找不到 claude CLI")
-    cwd, guild = scanner.session_location(body.adventurer_id)
+    cwd, guild = _resolve_or_404(body.adventurer_id)
     if sys.platform != "win32":
         raise HTTPException(status_code=501, detail="接續目前僅支援 Windows")
     try:

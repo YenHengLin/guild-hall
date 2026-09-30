@@ -125,8 +125,21 @@ def _git_commit(paths: list[Path], msg: str) -> str:
         return f"written (commit failed: {exc})"
 
 
+def _card_kind(row) -> str | None:
+    card = row["card"] if "card" in row.keys() else None
+    if not card:
+        return None
+    try:
+        return json.loads(card).get("kind")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def process_report(row) -> tuple[str, str]:
     """把一筆回報寫入 wiki。回傳 (status, result)。IO 密集,在執行緒中呼叫。"""
+    # 教學卡是自足的學習成品:不寫工作回報 wiki、不跑櫃檯合成(省 token),直接完成。
+    if _card_kind(row) == "teaching":
+        return "done", None
     guild = row["guild"] or "未知公會"
     title = row["title"] or "無題回報"
     today = date.today().strftime("%Y-%m-%d")
@@ -172,11 +185,24 @@ def process_report(row) -> tuple[str, str]:
 
     _prepend_log(f"## [{today}] task | {guild} 回報:{title}")
 
-    # A4+ 深度合成:headless Claude 把回報綜合進主題頁 + index.md(失敗不影響歸檔)
+    # A4+ 深度合成:同一次 headless Claude 呼叫既把回報綜合進主題頁 + index.md,
+    # 也回一份給使用者看的講評(失敗不影響歸檔)。
     synth = synthesis.synthesize(row, WIKI_DIR, page.stem)
 
     committed = _git_commit([WIKI_DIR], f"公會回報: {guild} — {title}")
-    return "done", f"{page.name} · {review} · {synth} · {committed}"
+
+    # 顯示優先用 LLM 講評(它真的讀懂了報告);合成沒跑/沒產出才退回啟發式檢查。
+    foot = " · ".join(x for x in [
+        f"🗂 {page.name}",
+        synth["synth"],
+        f"${synth['cost']:.4f}" if isinstance(synth.get("cost"), (int, float)) and synth["cost"] else "",
+        committed,
+    ] if x)
+    if synth.get("review"):
+        result = f"{synth['review']}\n\n<sub>{foot}</sub>"
+    else:
+        result = f"{review}\n\n<sub>{foot}</sub>"
+    return "done", result
 
 
 async def worker_loop(poll_sec: float = 2.0) -> None:

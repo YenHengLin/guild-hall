@@ -90,13 +90,6 @@ def _merge_deeds(items) -> Deeds:
         d.prompts += x.prompts
     return d
 
-# 內建工具集合(用來標記 SkillStat.kind)
-BUILTIN_TOOLS = {
-    "Edit", "Write", "Read", "Bash", "PowerShell", "Glob", "Grep",
-    "TaskCreate", "TaskUpdate", "AskUserQuestion", "WebSearch", "WebFetch",
-    "Skill", "ToolSearch", "Agent", "NotebookEdit", "SendUserFile",
-}
-
 
 def _parse_ts(raw: str | None) -> datetime | None:
     if not raw:
@@ -127,6 +120,7 @@ class _Accum:
         self.branch: str | None = None
         self.version: str | None = None
         self.cwd: str | None = None
+        self.launch_cwd: str | None = None  # 第一個記錄的 cwd = 啟動目錄(resume 用,精確)
         self.last_ts: datetime | None = None
         self.tools: Counter[str] = Counter()
         self.skills: Counter[str] = Counter()
@@ -150,6 +144,8 @@ def _consume_line(acc: _Accum, d: dict) -> None:
 
     if d.get("cwd"):
         acc.cwd = d["cwd"]
+        if acc.launch_cwd is None:
+            acc.launch_cwd = d["cwd"]  # 只記第一個 = 啟動目錄,不隨途中 cd 漂移
     if d.get("gitBranch"):
         acc.branch = d["gitBranch"]
     if d.get("version"):
@@ -237,8 +233,7 @@ def _skill_stats(acc: _Accum, top: int | None) -> list[SkillStat]:
     for name, count in acc.skills.most_common():
         combined.append(SkillStat(name=name, count=count, kind="skill"))
     for name, count in acc.tools.most_common():
-        kind = "tool" if name in BUILTIN_TOOLS else "tool"
-        combined.append(SkillStat(name=name, count=count, kind=kind))
+        combined.append(SkillStat(name=name, count=count, kind="tool"))
     # skill 優先排前,再依次數
     combined.sort(key=lambda s: (s.kind != "skill", -s.count))
     return combined[:top] if top else combined
@@ -294,6 +289,9 @@ _CLASS_RULES: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"stock|predict|api|data", re.I), "🔮", "預言家"),
 ]
 _DEFAULT_CLASS = ("🗡️", "冒險者")  # 無明確專精者一律收斂為通用冒險者
+# 職業 → 圖示(供手動指定職業時查圖示;與前端 labels.js 的 CLASSES 一致)
+_ICON_BY_KLASS = {klass: icon for _re, icon, klass in _CLASS_RULES}
+_ICON_BY_KLASS["冒險者"] = "🗡️"
 
 
 def _class_of(adv: Adventurer) -> tuple[str, str, str]:
@@ -312,56 +310,90 @@ def _pick_status(members: list[Adventurer]) -> str:
     return min((m.status for m in members), key=lambda s: order.get(s, 3))
 
 
+def _make_persona(dir_key: str, guild_name: str, key: str, icon: str, klass: str,
+                  members: list[Adventurer], name: str | None = None) -> Persona:
+    """由一組成員 session 組出一位 persona 角色(取名的 persona 只含 1 個 session)。"""
+    members = sorted(members, key=lambda a: a.last_active or "", reverse=True)
+    lead = members[0]
+    merged: Counter[str] = Counter()
+    kinds: dict[str, str] = {}
+    for a in members:
+        for s in a.top_skills:
+            merged[s.name] += s.count
+            kinds[s.name] = s.kind
+    top_skills = [
+        SkillStat(name=n, count=c, kind=kinds.get(n, "tool"))  # type: ignore[arg-type]
+        for n, c in merged.most_common(3)
+    ]
+    return Persona(
+        id=f"{dir_key}::{key}",
+        guild=guild_name,
+        class_key=key,
+        klass=klass,
+        icon=icon,
+        name=name,
+        status=_pick_status(members),  # type: ignore[arg-type]
+        last_active=lead.last_active,
+        total_tokens=sum(a.total_tokens for a in members),
+        deeds=_merge_deeds(a.deeds for a in members),
+        xp=sum(a.xp for a in members),
+        level=level_from_xp(sum(a.xp for a in members)),
+        quest_count=len(members),
+        active_quest_count=sum(1 for a in members if a.status == "adventuring"),
+        lead_id=lead.id,
+        title=lead.title,
+        last_prompt=lead.last_prompt,
+        top_skills=top_skills,
+        quests=members,
+    )
+
+
 def _group_personas(dir_key: str, guild_name: str,
                     advs: list[Adventurer]) -> list[Persona]:
-    """把一個公會的 session 冒險者依職業收斂成 persona 角色。"""
+    """把一個公會的 session 收斂成 persona 角色。
+
+    套用使用者身份覆蓋:
+    - 指定職業 → 該 session 改歸到指定職業(影響合併分組與圖示)。
+    - 取名 → 該 session **獨立成單獨一位角色**(不與同職者合併),大廳顯示取的名字。
+    """
+    overrides = db.all_overrides()
     groups: dict[str, list[Adventurer]] = {}
     meta: dict[str, tuple[str, str]] = {}  # class_key -> (icon, klass)
-    for a in advs:
-        key, icon, klass = _class_of(a)
-        groups.setdefault(key, []).append(a)
-        meta.setdefault(key, (icon, klass))
-
     personas: list[Persona] = []
+
+    for a in advs:
+        ov = overrides.get(a.id) or {}
+        ov_name = (ov.get("name") or "").strip()
+        ov_class = (ov.get("klass") or "").strip()
+        key, icon, klass = _class_of(a)
+        if ov_class:
+            klass = ov_class
+            icon = _ICON_BY_KLASS.get(ov_class, icon)
+            key = ov_class
+        if ov_name:
+            # 取名 → 獨立成一位(以 session id 當 key,穩定且不與他人合併)
+            personas.append(_make_persona(
+                dir_key, guild_name, f"named:{a.id}", icon, klass, [a], name=ov_name))
+        else:
+            groups.setdefault(key, []).append(a)
+            meta.setdefault(key, (icon, klass))
+
     for key, members in groups.items():
-        members.sort(key=lambda a: a.last_active or "", reverse=True)
-        lead = members[0]
         icon, klass = meta[key]
-        tokens = sum(a.total_tokens for a in members)
-        deeds = _merge_deeds(a.deeds for a in members)
-        xp = sum(a.xp for a in members)
-        merged: Counter[str] = Counter()
-        kinds: dict[str, str] = {}
-        for a in members:
-            for s in a.top_skills:
-                merged[s.name] += s.count
-                kinds[s.name] = s.kind
-        top_skills = [
-            SkillStat(name=n, count=c, kind=kinds.get(n, "tool"))  # type: ignore[arg-type]
-            for n, c in merged.most_common(3)
-        ]
-        personas.append(Persona(
-            id=f"{dir_key}::{key}",
-            guild=guild_name,
-            class_key=key,
-            klass=klass,
-            icon=icon,
-            status=_pick_status(members),  # type: ignore[arg-type]
-            last_active=lead.last_active,
-            total_tokens=tokens,
-            deeds=deeds,
-            xp=xp,
-            level=level_from_xp(xp),
-            quest_count=len(members),
-            active_quest_count=sum(1 for a in members if a.status == "adventuring"),
-            lead_id=lead.id,
-            title=lead.title,
-            last_prompt=lead.last_prompt,
-            top_skills=top_skills,
-            quests=members,
-        ))
+        personas.append(_make_persona(dir_key, guild_name, key, icon, klass, members))
+
     personas.sort(key=lambda p: (-p.active_quest_count, -p.quest_count))
     return personas
+
+
+def _encode_dir_key(path: str) -> str:
+    """把一個 cwd 編成 claude 的 project 目錄名(`:` `\\` `/` 皆轉 `-`)。
+
+    用來驗證 session 內記錄的 cwd 是否就是它的啟動目錄:編碼結果等於實際資料夾名,
+    才代表沒在途中漂移過。注意此編碼有損(真連字號與路徑分隔都成 `-`),故僅用於
+    「正向驗證」,不用於反解。
+    """
+    return re.sub(r"[:/\\]", "-", path)
 
 
 def _guild_name_and_path(dir_key: str, cwd: str | None) -> tuple[str, str]:
@@ -597,7 +629,14 @@ def scan_report() -> Report:
 
 
 def session_location(session_id: str) -> tuple[str | None, str | None]:
-    """找到 session 的真實工作目錄與公會名(給召回時當 claude 的 cwd)。"""
+    """找到 session 的『啟動目錄』與公會名(給召回時當 claude --resume 的 cwd)。
+
+    關鍵:`claude --resume <id>` 是用「當前 cwd 換算出的 project 目錄名」去找 jsonl,
+    而那個目錄名就是 jsonl 實際所在的資料夾(sub.name)。因此必須用 sub.name 反解出
+    啟動目錄,**不能**用 session 內部記錄的 cwd(acc.cwd)—— 後者可能在工作途中被
+    cd 到別處(例如去改 .claude/ 底下的檔),與啟動目錄不符就會讓 resume 找不到
+    session(claude 回「No conversation found」),所有召回/接續入口跟著失效。
+    """
     if not PROJECTS_DIR.exists():
         return None, None
     for sub in PROJECTS_DIR.iterdir():
@@ -606,7 +645,14 @@ def session_location(session_id: str) -> tuple[str | None, str | None]:
         jsonl = sub / f"{session_id}.jsonl"
         if jsonl.exists():
             acc = cache.get_or_parse(jsonl, parse_session)
-            name, path = _guild_name_and_path(sub.name, acc.cwd)
+            # 用「第一個記錄的 cwd」= 啟動目錄:它精確等於 claude 據以定位 session 的
+            # project 目錄(不像途中被 cd 漂移的 acc.cwd)。驗證它編碼回去確實等於資料夾
+            # 名,確認無誤後採用(精確、不受連字號路徑如 guild-hall 反解有損之害)。
+            # 萬一 launch_cwd 缺失或不符(舊快取/異常),才退回用資料夾名粗略反解。
+            launch = acc.launch_cwd
+            if launch and _encode_dir_key(launch) == sub.name:
+                return launch, Path(launch).name or launch
+            name, path = _guild_name_and_path(sub.name, None)
             return path, name
     return None, None
 
@@ -624,10 +670,13 @@ def get_adventurer(session_id: str) -> AdventurerDetail | None:
         acc = cache.get_or_parse(jsonl, parse_session)
         base = _accum_to_adventurer(session_id, acc)
         guild_name, _ = _guild_name_and_path(sub.name, acc.cwd)
+        ov = db.get_override(session_id)
         return AdventurerDetail(
             **base.model_dump(),
             guild=guild_name,
             recent_log=acc.log[-80:][::-1],
             all_skills=_skill_stats(acc, top=None),
+            custom_name=(ov["name"] if ov else None),
+            custom_class=(ov["klass"] if ov else None),
         )
     return None

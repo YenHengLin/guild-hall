@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS reports (
     status        TEXT DEFAULT 'pending',   -- pending/processing/done/failed
     result        TEXT,           -- 存檔路徑或錯誤訊息
     created_at    TEXT,
-    processed_at  TEXT
+    processed_at  TEXT,
+    card          TEXT            -- 職業結果卡(JSON;如 coding 卡的檔案 diff),供前端依職業渲染
 );
 
 CREATE TABLE IF NOT EXISTS hidden_adventurers (
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS commissions (
     note        TEXT,
     status      TEXT DEFAULT 'open',   -- open / done
     created_at  TEXT,
-    done_at     TEXT
+    done_at     TEXT,
+    klass       TEXT                   -- 指定職業/呈現皮膚(coding diff / 教學字卡…)
 );
 
 CREATE TABLE IF NOT EXISTS evolutions (
@@ -75,6 +77,18 @@ CREATE TABLE IF NOT EXISTS commission_events (
     created_at    TEXT
 );
 
+CREATE TABLE IF NOT EXISTS cost_ledger (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source        TEXT,    -- dispatch / recall / training / synthesis
+    commission_id INTEGER, -- 派遣才有;其餘為 NULL
+    adventurer_id TEXT,
+    guild         TEXT,
+    model         TEXT,
+    cost          REAL,
+    detail        TEXT,    -- 例:回合 3
+    created_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS evolution_proposals (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     adventurer_id    TEXT,    -- distill(全公會提煉)時為 NULL
@@ -88,6 +102,52 @@ CREATE TABLE IF NOT EXISTS evolution_proposals (
     decided_note     TEXT,
     created_at       TEXT,
     decided_at       TEXT
+);
+
+-- 學習迴路 A:使用者退回報告時說的「哪裡不清楚」→ 櫃台學到的敘事偏好
+-- (注入深度合成講評 prompt,讓之後的報告照使用者喜歡的方式寫)
+CREATE TABLE IF NOT EXISTS reception_prefs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild      TEXT,
+    note       TEXT,
+    created_at TEXT
+);
+
+-- 學習迴路 B:使用者叫冒險者繼續做時給的指示 → 冒險者學到的做事方式
+-- (注入派遣 prompt 的能力段,並作為訓練所提煉 skill 的素材)
+CREATE TABLE IF NOT EXISTS work_prefs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild         TEXT,
+    adventurer_id TEXT,
+    note          TEXT,
+    created_at    TEXT
+);
+
+-- 公會夜巡:NPC 冒險者在預算/時段內自主巡視各專案,產出的「改善靈感卡」
+CREATE TABLE IF NOT EXISTS muse_ideas (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild      TEXT,
+    cwd        TEXT,     -- 產這則靈感時巡的資料夾(採納成委託時當工作目錄)
+    kind       TEXT,     -- improve / bug / refactor / idea / test / doc …
+    title      TEXT,
+    body       TEXT,     -- markdown:為什麼、怎麼做、預期效益
+    effort     TEXT,     -- S / M / L(粗估工作量)
+    auto_safe  INTEGER,  -- 1/0/NULL:模型判定是否可安全自動執行
+    status     TEXT DEFAULT 'new',  -- new / promoted(已轉委託)/ dismissed
+    created_at TEXT
+);
+
+-- 通用鍵值設定(目前存夜巡設定 JSON)
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+-- 冒險者身份覆蓋:使用者手動取的名字 / 指定的職業(依 session id)
+CREATE TABLE IF NOT EXISTS session_overrides (
+    session_id TEXT PRIMARY KEY,
+    name       TEXT,
+    klass      TEXT,
+    updated_at TEXT
 );
 """
 
@@ -132,6 +192,9 @@ def _migrate() -> None:
             c.execute("ALTER TABLE reports ADD COLUMN review TEXT DEFAULT 'pending'")
         if "review_note" not in cols:
             c.execute("ALTER TABLE reports ADD COLUMN review_note TEXT")
+        # 職業結果卡(JSON):讓結果依冒險者職業渲染成專屬介面(如 coding diff 卡)
+        if "card" not in cols:
+            c.execute("ALTER TABLE reports ADD COLUMN card TEXT")
         # 派遣系統:替既有 commissions 表補欄位
         ccols = {r["name"] for r in c.execute("PRAGMA table_info(commissions)")}
         for col, ddl in [
@@ -143,9 +206,21 @@ def _migrate() -> None:
              "ALTER TABLE commissions ADD COLUMN stop_requested INTEGER DEFAULT 0"),
             # 冒險者位階:派遣時用的模型(空 = 跟隨 CLI 預設)
             ("model", "ALTER TABLE commissions ADD COLUMN model TEXT"),
+            # 成本帳本:此委託累計花費(USD,跨多次派遣累加)
+            ("cost", "ALTER TABLE commissions ADD COLUMN cost REAL DEFAULT 0"),
+            # 附圖:JSON 陣列,存 /uploads/... URL(供顯示與派遣時注入圖片路徑)
+            ("images", "ALTER TABLE commissions ADD COLUMN images TEXT"),
+            # 指定職業/呈現皮膚(決定派遣結果卡的種類:coding diff / 教學字卡)
+            ("klass", "ALTER TABLE commissions ADD COLUMN klass TEXT"),
         ]:
             if col not in ccols:
                 c.execute(ddl)
+        # 夜巡靈感:補 auto_safe 欄(舊 DB 沒有)
+        mcols = {r["name"] for r in c.execute("PRAGMA table_info(muse_ideas)")}
+        if "muse_ideas" in {r["name"] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")} \
+                and "auto_safe" not in mcols:
+            c.execute("ALTER TABLE muse_ideas ADD COLUMN auto_safe INTEGER")
         c.commit()
 
 
@@ -157,16 +232,17 @@ def enqueue(
     files_changed: str,
     lessons: str | None,
     outcome: str,
+    card: str | None = None,
 ) -> int:
     with _lock:
         c = get_conn()
         cur = c.execute(
             """INSERT INTO reports
                (adventurer_id, guild, title, summary, files_changed, lessons,
-                outcome, status, created_at)
-               VALUES (?,?,?,?,?,?,?, 'pending', ?)""",
+                outcome, status, created_at, card)
+               VALUES (?,?,?,?,?,?,?, 'pending', ?, ?)""",
             (adventurer_id, guild, title, summary, files_changed, lessons,
-             outcome, _now()),
+             outcome, _now(), card),
         )
         c.commit()
         return int(cur.lastrowid)
@@ -267,13 +343,14 @@ def hidden_ids() -> set[str]:
 
 # ── 委託布告欄(使用者自己貼的任務)────────────────────────
 
-def add_commission(guild: str | None, title: str, note: str | None) -> int:
+def add_commission(guild: str | None, title: str, note: str | None,
+                   images: str | None = None) -> int:
     with _lock:
         c = get_conn()
         cur = c.execute(
-            "INSERT INTO commissions (guild, title, note, status, created_at) "
-            "VALUES (?,?,?, 'open', ?)",
-            (guild, title, note, _now()),
+            "INSERT INTO commissions (guild, title, note, images, status, created_at) "
+            "VALUES (?,?,?,?, 'open', ?)",
+            (guild, title, note, images, _now()),
         )
         c.commit()
         return int(cur.lastrowid)
@@ -311,6 +388,25 @@ def delete_commission(cid: int) -> None:
 
 # ── 進化系統 ─────────────────────────────────────────────
 
+def update_report_card(report_id: int, card_str: str) -> None:
+    """覆寫某回報的結果卡 JSON(供學習書架重新歸類 / 補延伸主題)。"""
+    with _lock:
+        c = get_conn()
+        c.execute("UPDATE reports SET card=? WHERE id=?", (card_str, report_id))
+        c.commit()
+
+
+def reports_with_card() -> list[sqlite3.Row]:
+    """所有帶結果卡的回報(新→舊),供學習書架 / 分類彙整。"""
+    with _lock:
+        try:
+            return get_conn().execute(
+                "SELECT * FROM reports WHERE card IS NOT NULL ORDER BY id DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+
 def completed_reports(adventurer_id: str) -> list[sqlite3.Row]:
     """某冒險者已成功歸檔的回報(最新在前),供進化分析。"""
     with _lock:
@@ -342,6 +438,23 @@ def list_evolutions(adventurer_id: str | None = None) -> list[sqlite3.Row]:
                 (adventurer_id,),
             ).fetchall()
         return c.execute("SELECT * FROM evolutions ORDER BY id DESC").fetchall()
+
+
+def evolutions_for_guild(guild: str | None) -> list[sqlite3.Row]:
+    """某公會已習得的能力(進化紀錄,最新在前),供派遣時注入 prompt。
+
+    含該公會下所有冒險者的進化,以及 distill(全公會提煉)登記在此公會的通則。
+    """
+    if not guild:
+        return []
+    with _lock:
+        try:
+            return get_conn().execute(
+                "SELECT * FROM evolutions WHERE guild=? ORDER BY id DESC",
+                (guild,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
 
 
 def evolution_count_map() -> dict[str, int]:
@@ -384,6 +497,42 @@ def delete_ability(ability_id: int) -> None:
         c.commit()
 
 
+# ── 冒險者身份覆蓋(手動取名 / 指定職業)────────────────────
+
+def set_override(session_id: str, name: str | None, klass: str | None) -> None:
+    """設定(或更新)某 session 的取名 / 職業。空字串一律存 None。"""
+    with _lock:
+        c = get_conn()
+        c.execute(
+            """INSERT INTO session_overrides (session_id, name, klass, updated_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 name=excluded.name, klass=excluded.klass, updated_at=excluded.updated_at""",
+            (session_id, (name or None), (klass or None), _now()),
+        )
+        c.commit()
+
+
+def get_override(session_id: str) -> sqlite3.Row | None:
+    with _lock:
+        try:
+            return get_conn().execute(
+                "SELECT * FROM session_overrides WHERE session_id=?", (session_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+
+
+def all_overrides() -> dict[str, dict]:
+    """session_id → {name, klass}(供 scanner 一次載入套用)。"""
+    with _lock:
+        try:
+            rows = get_conn().execute("SELECT * FROM session_overrides").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    return {r["session_id"]: {"name": r["name"], "klass": r["klass"]} for r in rows}
+
+
 # ── 派遣系統(委託 → headless 冒險者回合制執行)──────────────
 
 def get_commission(cid: int) -> sqlite3.Row | None:
@@ -391,6 +540,37 @@ def get_commission(cid: int) -> sqlite3.Row | None:
         return get_conn().execute(
             "SELECT * FROM commissions WHERE id=?", (cid,)
         ).fetchone()
+
+
+def next_queued() -> int | None:
+    """佇列中最舊的一張待派遣委託(FIFO by id)。worker 逐一抽取。"""
+    with _lock:
+        row = get_conn().execute(
+            "SELECT id FROM commissions WHERE status='queued' ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def queued_ids() -> list[int]:
+    """目前排隊中的委託 id(FIFO 順序),供前端顯示佇列位置。"""
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT id FROM commissions WHERE status='queued' ORDER BY id ASC"
+        ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def reset_working_to_blocked() -> list[int]:
+    """把殘留的 working 委託重設為 blocked。啟動時呼叫:後端重啟會殺掉記憶體裡的
+    派遣任務,但 DB 列仍停在 working 而無人續跑 —— 轉 blocked 讓使用者可重新派遣。"""
+    with _lock:
+        c = get_conn()
+        ids = [r["id"] for r in
+               c.execute("SELECT id FROM commissions WHERE status='working'")]
+        if ids:
+            c.execute("UPDATE commissions SET status='blocked' WHERE status='working'")
+            c.commit()
+    return ids
 
 
 def update_commission(cid: int, **fields) -> None:
@@ -493,6 +673,229 @@ def decide_proposal(pid: int, status: str, note: str | None = None) -> None:
             (status, note, _now(), pid),
         )
         c.commit()
+
+
+# ── 成本帳本(每筆 headless 花費記帳;派遣累計進委託)──────────
+
+def add_cost(
+    source: str, cost: float, *,
+    commission_id: int | None = None, adventurer_id: str | None = None,
+    guild: str | None = None, model: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """記一筆花費。若屬某委託,同步累加進 commissions.cost(布告欄直接顯示)。"""
+    if not cost:
+        return
+    with _lock:
+        c = get_conn()
+        c.execute(
+            """INSERT INTO cost_ledger
+               (source, commission_id, adventurer_id, guild, model, cost, detail, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (source, commission_id, adventurer_id, guild, model, cost, detail, _now()),
+        )
+        if commission_id is not None:
+            c.execute(
+                "UPDATE commissions SET cost=COALESCE(cost,0)+? WHERE id=?",
+                (cost, commission_id),
+            )
+        c.commit()
+
+
+def commission_cost(cid: int) -> float:
+    with _lock:
+        row = get_conn().execute(
+            "SELECT cost FROM commissions WHERE id=?", (cid,)
+        ).fetchone()
+    return float(row["cost"] or 0) if row else 0.0
+
+
+def cost_summary() -> dict:
+    """月報表 + 各來源小計 + 總計,供成本面板顯示。"""
+    with _lock:
+        c = get_conn()
+        try:
+            by_month = c.execute(
+                """SELECT substr(created_at,1,7) AS month, source,
+                          SUM(cost) AS total, COUNT(*) AS n
+                   FROM cost_ledger GROUP BY month, source
+                   ORDER BY month DESC, source"""
+            ).fetchall()
+            total = c.execute("SELECT COALESCE(SUM(cost),0) t FROM cost_ledger").fetchone()["t"]
+        except sqlite3.OperationalError:
+            return {"total": 0.0, "months": []}
+    months: dict[str, dict] = {}
+    for r in by_month:
+        m = months.setdefault(r["month"], {"month": r["month"], "total": 0.0, "sources": {}})
+        m["sources"][r["source"]] = {"cost": round(r["total"] or 0, 4), "n": r["n"]}
+        m["total"] = round(m["total"] + (r["total"] or 0), 4)
+    return {"total": round(total or 0, 4), "months": list(months.values())}
+
+
+def spent_since(iso_ts: str) -> float:
+    """自某 UTC ISO 時間點以來的總花費(供夜巡每日預算護欄)。"""
+    with _lock:
+        try:
+            row = get_conn().execute(
+                "SELECT COALESCE(SUM(cost),0) t FROM cost_ledger WHERE created_at >= ?",
+                (iso_ts,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0.0
+    return float(row["t"] or 0)
+
+
+# ── 通用設定(鍵值)──────────────────────────────────────────────
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with _lock:
+        row = get_conn().execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with _lock:
+        c = get_conn()
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        c.commit()
+
+
+# ── 公會夜巡靈感卡 ───────────────────────────────────────────────
+
+def add_idea(guild: str | None, cwd: str | None, kind: str,
+             title: str, body: str | None, effort: str | None,
+             auto_safe: bool | None = None) -> int:
+    safe = None if auto_safe is None else (1 if auto_safe else 0)
+    with _lock:
+        c = get_conn()
+        cur = c.execute(
+            "INSERT INTO muse_ideas (guild, cwd, kind, title, body, effort, "
+            "auto_safe, status, created_at) VALUES (?,?,?,?,?,?,?, 'new', ?)",
+            (guild, cwd, kind, title, body, effort, safe, _now()),
+        )
+        c.commit()
+        return int(cur.lastrowid)
+
+
+def new_ideas() -> list[sqlite3.Row]:
+    """所有待處理(new)靈感,舊到新(供自動執行從既有清單挑)。"""
+    with _lock:
+        return get_conn().execute(
+            "SELECT * FROM muse_ideas WHERE status='new' ORDER BY id ASC"
+        ).fetchall()
+
+
+def list_ideas(limit: int = 60) -> list[sqlite3.Row]:
+    with _lock:
+        return get_conn().execute(
+            "SELECT * FROM muse_ideas ORDER BY status='dismissed', "
+            "status!='new', id DESC LIMIT ?", (limit,),
+        ).fetchall()
+
+
+def get_idea(iid: int) -> sqlite3.Row | None:
+    with _lock:
+        return get_conn().execute(
+            "SELECT * FROM muse_ideas WHERE id=?", (iid,)
+        ).fetchone()
+
+
+def set_idea_status(iid: int, status: str) -> None:
+    with _lock:
+        c = get_conn()
+        c.execute("UPDATE muse_ideas SET status=? WHERE id=?", (status, iid))
+        c.commit()
+
+
+def delete_idea(iid: int) -> None:
+    with _lock:
+        c = get_conn()
+        c.execute("DELETE FROM muse_ideas WHERE id=?", (iid,))
+        c.commit()
+
+
+def idea_titles_for_guild(guild: str | None, limit: int = 60) -> list[str]:
+    """該公會現有(未 dismissed)靈感的標題 —— 餵進夜巡 prompt,叫它別重複產同一則。"""
+    with _lock:
+        rows = get_conn().execute(
+            "SELECT title FROM muse_ideas WHERE guild IS ? AND status!='dismissed' "
+            "ORDER BY id DESC LIMIT ?", (guild, limit),
+        ).fetchall()
+    return [r["title"] for r in rows if r["title"]]
+
+
+def idea_title_exists(guild: str | None, title: str) -> bool:
+    """同公會是否已有同標題的靈感(去重,避免夜巡反覆產同一則)。"""
+    with _lock:
+        row = get_conn().execute(
+            "SELECT 1 FROM muse_ideas WHERE guild IS ? AND title=? LIMIT 1",
+            (guild, title),
+        ).fetchone()
+    return row is not None
+
+
+# ── 學習迴路:敘事偏好(櫃台)/ 做事方式偏好(冒險者)──────────────
+
+def add_reception_pref(note: str | None, guild: str | None = None) -> None:
+    """記一條櫃台敘事偏好(來自使用者退回報告時的說明)。空白則略過。"""
+    if not note or not note.strip():
+        return
+    with _lock:
+        c = get_conn()
+        c.execute(
+            "INSERT INTO reception_prefs (guild, note, created_at) VALUES (?,?,?)",
+            (guild, note.strip()[:500], _now()),
+        )
+        c.commit()
+
+
+def list_reception_prefs(limit: int = 8) -> list[sqlite3.Row]:
+    """最近的櫃台敘事偏好(新→舊),供合成講評 prompt 注入。"""
+    with _lock:
+        try:
+            return get_conn().execute(
+                "SELECT * FROM reception_prefs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+
+def add_work_pref(note: str | None, guild: str | None = None,
+                  adventurer_id: str | None = None) -> None:
+    """記一條做事方式偏好(來自使用者叫冒險者繼續做時的指示)。空白則略過。"""
+    if not note or not note.strip():
+        return
+    with _lock:
+        c = get_conn()
+        c.execute(
+            "INSERT INTO work_prefs (guild, adventurer_id, note, created_at) "
+            "VALUES (?,?,?,?)",
+            (guild, adventurer_id, note.strip()[:500], _now()),
+        )
+        c.commit()
+
+
+def list_work_prefs(guild: str | None = None, limit: int = 8) -> list[sqlite3.Row]:
+    """做事方式偏好(新→舊)。給了 guild 就只取該公會的,供派遣 prompt 注入。"""
+    with _lock:
+        try:
+            c = get_conn()
+            if guild:
+                return c.execute(
+                    "SELECT * FROM work_prefs WHERE guild=? ORDER BY id DESC LIMIT ?",
+                    (guild, limit),
+                ).fetchall()
+            return c.execute(
+                "SELECT * FROM work_prefs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
 
 
 def add_evolution(

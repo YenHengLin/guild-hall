@@ -81,6 +81,7 @@ class Persona(BaseModel):
     active_quest_count: int = 0
     lead_id: str  # 代表 session(最近活動),點角色預設開這趟
     title: str | None = None  # 代表 session 的任務名(最近在做什麼)
+    name: str | None = None  # 使用者手動取的角色名(有則大廳顯示此名,取代職業名)
     last_prompt: str | None = None
     top_skills: list[SkillStat] = []
     quests: list[Adventurer] = []  # 冒險日誌:同職所有 session
@@ -205,12 +206,23 @@ class ReportRecord(BaseModel):
     # 使用者幕後審核裁決:pending(待審)/ approved(認可)/ rejected(退回)
     review: Literal["pending", "approved", "rejected"] = "pending"
     review_note: str | None = None
+    # 職業結果卡:依冒險者職業渲染的結構化結果(如 coding 卡含檔案 diff)。None = 用 markdown 保底
+    card: dict | None = None
 
 
 class ReviewReject(BaseModel):
     """退回一份報告(退回櫃台重寫)。"""
 
     note: str | None = None
+
+
+class PolishReq(BaseModel):
+    """把使用者自己寫的草稿回報送 AI 潤稿(不歸檔,只回傳整理後的文字)。"""
+
+    title: str | None = None
+    summary: str | None = None
+    lessons: str | None = None
+    guild: str | None = None
 
 
 class ReviewSkill(BaseModel):
@@ -235,6 +247,9 @@ class QueueStatus(BaseModel):
     reception_level: int = 1
     reception_next_at: int | None = None  # 下一個審查技能的門檻
     review_skills: list[ReviewSkill] = []
+    # 學習迴路(退回 → 櫃台學敘事;繼續 → 冒險者學做事方式)
+    reception_prefs: list[str] = []  # A:櫃台學到的敘事偏好
+    work_prefs: list[str] = []       # B:冒險者學到的做事方式
 
 
 # ── 委託布告欄模型(使用者自己貼的任務)──────────────────────────
@@ -249,10 +264,12 @@ class CommissionPost(BaseModel):
     goal: str | None = None  # 明確目標(可中途修改);未填時派遣以 title 為目標
     cwd: str | None = None  # 派遣時的工作資料夾(公會路徑)
     model: str | None = None  # 冒險者位階(模型 id;空 = 跟隨 CLI 預設)
+    klass: str | None = None  # 指定職業/呈現皮膚(決定結果卡:coding diff / 教學字卡)
+    images: list[str] = []  # 附圖 URL(/uploads/...);派遣時注入路徑供冒險者讀圖
 
 
-# open(招募中)/ working(派遣執行中)/ blocked(受阻等指示)/ failed / done
-CommissionStatus = Literal["open", "working", "blocked", "failed", "done"]
+# open(招募中)/ queued(排隊等派遣)/ working(執行中)/ blocked(受阻等指示)/ failed / done
+CommissionStatus = Literal["open", "queued", "working", "blocked", "failed", "done"]
 
 
 class Commission(BaseModel):
@@ -271,6 +288,9 @@ class Commission(BaseModel):
     session_id: str | None = None  # headless 冒險者的 session(可續冒險)
     rounds: int = 0
     model: str | None = None  # 冒險者位階(派遣模型)
+    klass: str | None = None  # 指定職業/呈現皮膚
+    cost: float = 0.0  # 此委託累計花費(USD,跨多次派遣)
+    images: list[str] = []  # 附圖 URL(/uploads/...)
 
 
 class CommissionPatch(BaseModel):
@@ -300,7 +320,7 @@ class CommissionEvent(BaseModel):
     """委託進度時間線一則。"""
 
     id: int
-    type: Literal["steer", "progress", "system"]
+    type: Literal["steer", "progress", "system", "step"]
     content: str
     round: int | None = None
     created_at: str | None = None
@@ -402,6 +422,42 @@ class AbilityAdd(BaseModel):
     name: str
 
 
+# ── 公會夜巡(NPC 自主靈感)模型 ────────────────────────────────
+
+class MuseIdea(BaseModel):
+    """夜巡產出的一張改善靈感卡。"""
+
+    id: int
+    guild: str | None = None
+    cwd: str | None = None
+    kind: str = "idea"  # improve / bug / refactor / idea / test / doc
+    title: str
+    headline: str | None = None   # 一句白話:發現了什麼問題或機會(主人一眼掃)
+    next_step: str | None = None  # 一句白話:建議的下一步該做什麼
+    impact: str | None = None     # 影響/價值提示:高 / 中 / 低
+    body: str | None = None
+    effort: str | None = None  # S / M / L
+    status: Literal["new", "promoted", "dismissed"] = "new"
+    created_at: str | None = None
+
+
+class MuseConfig(BaseModel):
+    """夜巡設定(存 settings.muse,可由面板調整)。"""
+
+    enabled: bool = False           # 總開關
+    daily_budget_usd: float = 1.0   # 每日花費上限(達標即當日停巡)
+    hour_start: int = 1             # 允許巡邏的時段(本地 24h)起
+    hour_end: int = 6              # 時段迄(start<=hour<end;跨夜自動處理)
+    interval_min: int = 45          # 每輪間隔(分鐘)
+    ideas_per_run: int = 3          # 單輪最多產幾張靈感卡
+    model: str = "claude-sonnet-4-6"  # 巡邏用模型
+    include_guilds: list[str] = []  # 只巡這些公會(空 = 全部)
+    # 自主執行:夜巡自己挑「安全、自足、低風險」的靈感,直接排入派遣佇列做掉(免人工同意)
+    auto_execute: bool = False      # 自主執行總開關(預設關,開了會自動改檔+花 token)
+    auto_per_run: int = 1           # 每輪最多自動接幾張(其餘仍留給你人工挑)
+    auto_max_effort: str = "S"      # 只自動做這個工作量以下(S / M);L 一律留人工
+
+
 class AdventurerDetail(Adventurer):
     """冒險者細節 —— 含近期冒險日誌。"""
 
@@ -409,6 +465,15 @@ class AdventurerDetail(Adventurer):
     recent_log: list[LogEntry] = []
     all_skills: list[SkillStat] = []
     custom_abilities: list[Ability] = []  # 使用者手動編輯的能力
+    custom_name: str | None = None   # 使用者手動取的名字(None = 未取名)
+    custom_class: str | None = None  # 使用者手動指定的職業(None = 自動判定)
+
+
+class IdentitySet(BaseModel):
+    """設定冒險者身份:取名 / 指定職業(空字串 = 清除,回自動)。"""
+
+    name: str | None = None
+    klass: str | None = None
 
 
 class LogEntry(BaseModel):

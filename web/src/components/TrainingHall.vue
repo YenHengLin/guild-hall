@@ -20,9 +20,9 @@ const err = ref(null)
 
 async function decide(p, approve) {
   err.value = null
+  // 「批准 / 駁回」按鈕本身即確認;駁回才需追問原因
   let note = null
   if (!approve) note = prompt('駁回原因(可留空):') || null
-  else if (!confirm(`批准提案「${p.name}」?\n將寫入:${p.artifact_path || '(無檔案,僅登記)'}`)) return
   err.value = await store.decideProposal(p.id, approve, note)
 }
 async function doDistill() {
@@ -33,7 +33,7 @@ async function doDistill() {
 }
 async function doTrain(e) {
   err.value = null
-  if (!confirm(`送「${e.name}」進訓練所?會 spawn headless Claude 分析(花 token)。`)) return
+  // 產出的提案還需批准才落地,故不再二次確認
   await store.train(e.adventurer_id)
   if (store.trainError) err.value = store.trainError
 }

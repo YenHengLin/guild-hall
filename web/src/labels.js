@@ -1,5 +1,11 @@
 // 狀態 / 顯示文字對照
 
+// 主 Claude Code session「主動回報公會」的成果,一律掛在這個固定的「櫃台書記」身分下,
+// 而非某個被掃描到的 session —— 才不會混進使用者真正派遣的冒險者名冊 / 完成數。
+// 值需與「公會報告」skill POST 的 adventurer_id 一致。
+export const RECEPTION_ID = '櫃台書記'
+export const RECEPTION_PERSONA = { icon: '🧝‍♀️', klass: '櫃台書記', guild: '櫃台' }
+
 export const STATUS_META = {
   adventuring: { label: '冒險中', emoji: '⚔️', color: '#3f9142', dot: '#4caf50' },
   resting: { label: '休息中', emoji: '🍺', color: '#b8860b', dot: '#e0a815' },
@@ -102,6 +108,30 @@ export function classOf(adventurer) {
   return { icon: '🗡️', klass: '冒險者' }
 }
 
+// 所有可手動指定的職業(供冒險者頁的職業選單)
+export const CLASSES = [
+  { klass: '工程師', icon: '⚙️' },
+  { klass: '術士', icon: '🎨' },
+  { klass: '鑑定師', icon: '🧪' },
+  { klass: '書記官', icon: '📚' },
+  { klass: '機關師', icon: '🔧' },
+  { klass: '斥候', icon: '🌿' },
+  { klass: '預言家', icon: '🔮' },
+  { klass: '冒險者', icon: '🗡️' },
+]
+export function iconForClass(klass) {
+  return (CLASSES.find((c) => c.klass === klass) || { icon: '🗡️' }).icon
+}
+
+// 職業 → 結果皮膚(result card kind)。沒對應的職業就用 markdown 保底(回 null)。
+const CLASS_SKIN = {
+  工程師: 'coding', 機關師: 'coding',
+  書記官: 'teaching',
+}
+export function skinForClass(klass) {
+  return CLASS_SKIN[klass] || null
+}
+
 // 冒險者位階:派遣時用的模型(強弱 vs 花費的取捨)
 export const RANKS = [
   { value: '', label: '⭐ 預設位階(跟隨 CLI 設定)', short: '⭐' },
@@ -112,4 +142,30 @@ export const RANKS = [
 export function rankOf(model) {
   return RANKS.find((r) => r.value === (model || '')) ||
     { value: model, label: model, short: '❓' }
+}
+
+// 位階自動建議:依委託關鍵字 + 篇幅,粗略推薦一個派遣位階(使用者可覆寫)。
+// 高難度詞優先(即使夾雜小改字眼);其次輕量詞;最後看描述長短。
+const GOLD_KW = ['重構', 'refactor', '設計', 'design', '架構', 'architect',
+  '演算法', 'algorithm', '優化', 'optimi', '效能', 'performance', '除錯', 'debug',
+  '安全', 'security', '遷移', 'migrat', '複雜', '整個系統', '實作', '重寫', 'rewrite']
+const BRONZE_KW = ['改個字', '錯字', 'typo', '重新命名', 'rename', '改名', '加註解',
+  '註解', '格式化', 'format', '排版', '小改', '版號', 'bump', '拼字', '標點', '換行']
+
+export function suggestRank(text) {
+  const t = (text || '').toLowerCase().trim()
+  if (!t) return { value: '', reason: '' }
+  for (const k of GOLD_KW) {
+    if (t.includes(k.toLowerCase())) {
+      return { value: 'claude-opus-4-8', reason: `偵測到「${k}」,屬高難度工作` }
+    }
+  }
+  for (const k of BRONZE_KW) {
+    if (t.includes(k.toLowerCase())) {
+      return { value: 'claude-haiku-4-5-20251001', reason: `偵測到「${k}」,屬輕量改動` }
+    }
+  }
+  if (t.length > 120) return { value: 'claude-opus-4-8', reason: '委託描述長、範圍大' }
+  if (t.length < 20) return { value: 'claude-haiku-4-5-20251001', reason: '委託簡短' }
+  return { value: 'claude-sonnet-4-6', reason: '一般難度,均衡位階' }
 }

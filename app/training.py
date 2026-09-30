@@ -50,6 +50,8 @@ PROPOSE_PROMPT = """你是冒險者公會的訓練所教官。一位冒險者累
 {titles}
 - 近期心得/教訓:
 {lessons}
+- 使用者反覆給的做事指示(最直接的「使用者想要的做事方式」訊號,優先考慮固化成 skill/memory):
+{work_prefs}
 
 ## 你可以先偵察(唯讀)
 - `~/.claude/skills/` 下已有哪些 skill(避免重複;若已有相近 skill,提案改良它)
@@ -118,12 +120,14 @@ def _run_claude(prompt: str) -> dict:
         msg = (proc.stderr.decode("utf-8", "replace") or "").strip()[:400]
         return {"ok": False, "error": msg or f"claude 結束碼 {proc.returncode}"}
     raw = proc.stdout.decode("utf-8", "replace").strip()
+    cost = None
     try:
         data = json.loads(raw)
         text = (data.get("result") or data.get("text") or raw).strip()
+        cost = data.get("total_cost_usd")
     except json.JSONDecodeError:
         text = raw
-    return {"ok": True, "text": text}
+    return {"ok": True, "text": text, "cost": cost}
 
 
 def _extract_json(text: str) -> dict | None:
@@ -157,9 +161,12 @@ def propose_for(adventurer_id: str) -> dict:
     titles = "\n".join(f"  - {r['title']}" for r in reports[:8] if r["title"])
     lessons = "\n".join(f"  - {r['lessons']}" for r in reports[:8] if r["lessons"]) \
         or "  (無)"
+    work_prefs = "\n".join(
+        f"  - {w['note']}" for w in db.list_work_prefs(guild, 10) if w["note"]) \
+        or "  (無)"
     prompt = PROPOSE_PROMPT.format(
         guild=guild or "未知公會", completed=len(reports),
-        titles=titles or "  (無)", lessons=lessons)
+        titles=titles or "  (無)", lessons=lessons, work_prefs=work_prefs)
     return _propose(prompt, adventurer_id, guild)
 
 
@@ -181,6 +188,10 @@ def _propose(prompt: str, adventurer_id: str | None, guild: str | None) -> dict:
     res = _run_claude(prompt)
     if not res["ok"]:
         return {"ok": False, "error": res["error"]}
+    if res.get("cost"):
+        db.add_cost("training", float(res["cost"]), adventurer_id=adventurer_id,
+                    guild=guild, model=MODEL,
+                    detail="全公會提煉" if adventurer_id is None else "訓練分析")
     data = _extract_json(res["text"])
     if data is None:
         return {"ok": False, "error": f"提案解析失敗:{res['text'][:200]}"}

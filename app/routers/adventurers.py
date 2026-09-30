@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from .. import db
-from ..models import Ability, AbilityAdd, AdventurerDetail
+from ..models import Ability, AbilityAdd, AdventurerDetail, IdentitySet
 from ..scanner import get_adventurer
 
 router = APIRouter(prefix="/api", tags=["adventurers"])
@@ -42,6 +42,14 @@ def remove_ability(session_id: str, ability_id: int) -> list[Ability]:
     """移除一項自訂能力。"""
     db.delete_ability(ability_id)
     return _abilities(session_id)
+
+
+@router.post("/adventurers/{session_id}/identity")
+def set_identity(session_id: str, body: IdentitySet) -> dict:
+    """設定冒險者身份:取名 / 指定職業。取名會讓這位從合併的職業角色獨立出來。"""
+    db.set_override(session_id, (body.name or "").strip()[:24] or None,
+                    (body.klass or "").strip() or None)
+    return {"ok": True, "id": session_id}
 
 
 @router.post("/adventurers/{session_id}/hide")

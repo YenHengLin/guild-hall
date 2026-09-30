@@ -32,10 +32,10 @@ const learned = computed(() =>
   evoList.value.reduce((n, e) => n + (e.learned?.length || 0), 0),
 )
 
-// persona 用職業當名字(前端劍士 / Rust 法師…);session 用任務名
+// persona:有取名就用名字,否則用職業;session 用任務名
 const name = computed(() =>
   isPersona.value
-    ? props.adventurer.klass
+    ? (props.adventurer.name || props.adventurer.klass)
     : props.adventurer.title || props.adventurer.last_prompt?.slice(0, 14) || '無名冒險者',
 )
 

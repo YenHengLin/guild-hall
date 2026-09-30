@@ -1,8 +1,6 @@
 @echo off
 cd /d "%~dp0"
-echo ============================================
-echo    Guild Hall - starting up ...
-echo ============================================
+echo Guild Hall starting up ...
 
 REM ---- first run: install frontend deps ----
 if not exist "web\node_modules" (
@@ -12,20 +10,19 @@ if not exist "web\node_modules" (
   popd
 )
 
-REM ---- backend on port 8848 ----
-echo [1/2] backend  -> http://localhost:8848
-start "Guild Backend 8848" cmd /k "cd /d %~dp0 && python -m uvicorn app.main:app --port 8848 --reload"
+REM ---- backend + frontend run in two MINIMIZED, titled windows ----
+REM    titled so stop.bat can close the windows themselves (not just the ports)
+REM    no --reload: dispatch jobs often edit guild-hall's own .py files, which would
+REM    make --reload restart the very backend running the dispatch (self-eviction).
+REM    Restart manually after changing backend code.
+start "Guild Hall Backend" /min cmd /k "cd /d %~dp0 && python -m uvicorn app.main:app --port 8848"
+start "Guild Hall Frontend" /min cmd /k "cd /d %~dp0web && npm run dev"
 
-REM ---- frontend on port 5173 ----
-echo [2/2] frontend -> http://localhost:5173
-start "Guild Frontend 5173" cmd /k "cd /d %~dp0web && npm run dev"
-
-REM ---- wait, then open browser ----
 echo Waiting for services to boot ...
 timeout /t 6 >nul
 start "" "http://localhost:5173"
 
 echo.
-echo Done. If the browser did not open, go to http://localhost:5173
-echo To stop: close the two console windows, or run stop.bat
-pause
+
+REM no pause -> this launcher window closes itself (one less window to babysit).
+REM Two minimized consoles remain in the taskbar; run stop.bat to close both.

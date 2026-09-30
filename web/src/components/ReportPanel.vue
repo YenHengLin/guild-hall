@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import Heatmap from './Heatmap.vue'
+import CommissionReport from './CommissionReport.vue'
 import { useGuildStore } from '../stores/guild'
 import { shortTokens } from '../labels'
 
@@ -22,28 +23,13 @@ const REVIEW_BADGE = {
 const openId = ref(null)
 function toggle(id) { openId.value = openId.value === id ? null : id }
 
-// ── 幕後審核動作 ──
-const busy = ref(0) // 正在處理的 report id
-async function approve(r) {
-  busy.value = r.id
-  try { await store.reviewApprove(r.id) } finally { busy.value = 0 }
-}
-async function reject(r) {
-  const note = window.prompt('退回這份報告給櫃台重寫。\n可填退回原因(哪裡不清楚),留空也可以:', '')
-  if (note === null) return // 取消
-  busy.value = r.id
-  try { await store.reviewReject(r.id, note || null) } finally { busy.value = 0 }
-}
-function cont(r) {
-  if (!r.adventurer_id) return
-  if (!window.confirm('派這位冒險者接續改善(會 resume 原 session、實際改檔、花 token)。\n將開啟其面板讓你確認後派工。要繼續嗎?')) return
-  store.continueFromReport(r)
-}
-
 // 櫃台小姐成長
 const recLevel = computed(() => props.queue?.reception_level || 1)
 const recNextAt = computed(() => props.queue?.reception_next_at)
 const reviewSkills = computed(() => props.queue?.review_skills || [])
+// 學習迴路:退回報告 → 櫃台學敘事偏好;叫冒險者繼續 → 冒險者學做事方式
+const receptionPrefs = computed(() => props.queue?.reception_prefs || [])
+const workPrefs = computed(() => props.queue?.work_prefs || [])
 
 const today = computed(() => props.report?.today || {})
 const week = computed(() => props.report?.week || {})
@@ -53,6 +39,22 @@ const topGuilds = computed(() => props.report?.top_guilds_today || [])
 const maxGuild = computed(() =>
   Math.max(1, ...topGuilds.value.map((g) => g.events)),
 )
+
+// ── 成本帳本 ──
+const SRC_META = {
+  dispatch: { icon: '🚀', label: '派遣' },
+  recall: { icon: '🔮', label: '召回' },
+  training: { icon: '🎓', label: '訓練' },
+  synthesis: { icon: '🧬', label: '合成' },
+  polish: { icon: '✨', label: '潤稿' },
+  classify: { icon: '📚', label: '整理' },
+}
+const costs = computed(() => store.costs)
+const costTotal = computed(() => store.costs?.total || 0)
+function fmtUsd(v) {
+  const n = Number(v) || 0
+  return '$' + (n < 0.01 && n > 0 ? n.toFixed(4) : n.toFixed(2))
+}
 </script>
 
 <template>
@@ -109,6 +111,29 @@ const maxGuild = computed(() =>
         <Heatmap :days="report?.heatmap || []" />
       </div>
 
+      <!-- 成本帳本(每次 headless 花費記帳 → 月報表) -->
+      <div class="report__section">
+        <b>💰 成本帳本 <span class="dim">累計 {{ fmtUsd(costTotal) }}</span></b>
+        <div v-if="costs && costs.months.length" class="ledger">
+          <div v-for="m in costs.months" :key="m.month" class="ledger__month">
+            <div class="ledger__head">
+              <span class="ledger__mon">{{ m.month }}</span>
+              <span class="ledger__mtot">{{ fmtUsd(m.total) }}</span>
+            </div>
+            <div class="ledger__srcs">
+              <span v-for="(v, src) in m.sources" :key="src" class="ledger__src">
+                {{ (SRC_META[src] || {}).icon || '•' }}
+                {{ (SRC_META[src] || {}).label || src }}
+                {{ fmtUsd(v.cost) }} <i class="dim">×{{ v.n }}</i>
+              </span>
+            </div>
+          </div>
+        </div>
+        <div v-else class="dim" style="padding: 8px">
+          還沒有任何花費紀錄。派遣 / 召回 / 訓練冒險者會在此記帳。
+        </div>
+      </div>
+
       <!-- 櫃台小姐成長 -->
       <div class="report__section">
         <b>🧝‍♀️ 櫃台小姐 <span class="dim">Lv.{{ recLevel }}</span></b>
@@ -136,6 +161,29 @@ const maxGuild = computed(() =>
         </div>
       </div>
 
+      <!-- 學習迴路:退回 → 櫃台學敘事;繼續 → 冒險者學做事方式 -->
+      <div v-if="receptionPrefs.length || workPrefs.length" class="report__section">
+        <b>🔁 學習迴路 <span class="dim">從你的退回 / 繼續指示累積</span></b>
+        <div class="loop">
+          <div class="loop__col">
+            <div class="loop__h">🧝‍♀️ 櫃台學到的敘事偏好</div>
+            <div class="dim loop__hint">你「退回櫃台重寫」時的說明 → 之後報告會照這樣寫</div>
+            <ul v-if="receptionPrefs.length" class="loop__list">
+              <li v-for="(p, i) in receptionPrefs" :key="'rp' + i">{{ p }}</li>
+            </ul>
+            <div v-else class="dim loop__empty">還沒有。退回報告時寫下哪裡不清楚即可累積。</div>
+          </div>
+          <div class="loop__col">
+            <div class="loop__h">🧭 冒險者學到的做事方式</div>
+            <div class="dim loop__hint">你叫冒險者「繼續做」時的指示 → 之後派遣會照這些習慣</div>
+            <ul v-if="workPrefs.length" class="loop__list">
+              <li v-for="(p, i) in workPrefs" :key="'wp' + i">{{ p }}</li>
+            </ul>
+            <div v-else class="dim loop__empty">還沒有。對執行中的委託下中途指示即可累積。</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 櫃台回報紀錄(可展開看內容) -->
       <div class="report__section">
         <b>🗂 櫃台回報紀錄
@@ -150,6 +198,10 @@ const maxGuild = computed(() =>
               <div class="rep__main">
                 <div class="rep__title">{{ r.title }}</div>
                 <div class="rep__meta">
+                  <span v-if="store.personaBySession[r.adventurer_id]" class="rep__doer">
+                    {{ store.personaBySession[r.adventurer_id].icon }}
+                    {{ store.personaBySession[r.adventurer_id].klass }} ·
+                  </span>
                   🏰 {{ r.guild || '—' }} · {{ STATUS_TXT[r.status] || r.status }}
                 </div>
               </div>
@@ -158,37 +210,9 @@ const maxGuild = computed(() =>
               </span>
               <span class="rep__caret">{{ openId === r.id ? '▲' : '▼' }}</span>
             </div>
-            <!-- 展開:完整內容 + 櫃台審查 + 幕後審核 -->
+            <!-- 展開:完整內容 + 櫃台審查 + 幕後審核(與布告欄共用同一元件) -->
             <div v-if="openId === r.id" class="rep__body">
-              <div v-if="r.summary" class="rep__field"><b>內容</b>{{ r.summary }}</div>
-              <div v-if="r.files_changed?.length" class="rep__field">
-                <b>改動檔案</b>{{ r.files_changed.join('、') }}
-              </div>
-              <div v-if="r.lessons" class="rep__field"><b>心得</b>{{ r.lessons }}</div>
-              <div v-if="r.result" class="rep__review">🧝‍♀️ 櫃台審查:{{ r.result }}</div>
-              <div v-if="r.review_note" class="rep__review rep__review--no">
-                ↩️ 你的退回原因:{{ r.review_note }}
-              </div>
-
-              <!-- 幕後審核:認可 / 退回櫃台重寫 / 派冒險者接續 -->
-              <div class="rep__judge">
-                <div class="rep__judge-h">🎖 幕後審核</div>
-                <div class="rep__judge-btns">
-                  <button class="jbtn jbtn--ok" :disabled="busy === r.id" @click="approve(r)">
-                    {{ r.review === 'approved' ? '✅ 已認可' : '✅ 認可' }}
-                  </button>
-                  <button class="jbtn jbtn--redo" :disabled="busy === r.id" @click="reject(r)">
-                    ✍️ 退回櫃台重寫
-                  </button>
-                  <button class="jbtn jbtn--fix" :disabled="!r.adventurer_id" @click="cont(r)"
-                          :title="r.adventurer_id ? '' : '這份報告沒有對應的 session,無法召回'">
-                    🔧 派冒險者接續
-                  </button>
-                </div>
-                <div class="dim rep__judge-hint">
-                  報告寫不清楚 → 退回櫃台重寫;實際工作沒做好 → 派冒險者接續(召回原 session 改)
-                </div>
-              </div>
+              <CommissionReport :report="r" judge />
             </div>
           </div>
           <div v-if="reports.length === 0" class="dim" style="padding: 8px">

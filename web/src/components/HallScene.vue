@@ -14,6 +14,7 @@ const emit = defineEmits(['open', 'openReport'])
       <NoticeBoard
         :quests="report?.quests || []"
         :commissions="commissions || []"
+        :queue="queue"
         @open="(id) => emit('open', id)"
       />
       <ReceptionDesk :report="report" :queue="queue" @open="emit('openReport')" />
