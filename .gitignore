@@ -7,5 +7,4 @@ web/dist/
 uploads/
 
 config.yaml
-start.local.bat
 build_split_sheet.py

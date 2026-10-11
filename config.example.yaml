@@ -18,6 +18,15 @@ memory_dir: "~/.claude/memory"
 # 訓練所批准落地時額外允許寫入的根目錄(~/.claude、projects_dir、wiki 上層已預設允許)
 extra_write_roots: []
 
+# ── 遠端連線(Tailscale)──────────────────────────────
+# 預設 false:前端只聽 localhost,外面連不進來。
+# true:讓 tailnet 上的手機/筆電連前端(http://<主機名或 100.x IP>:5173)。
+#   只放行本機與 Tailscale 位址(100.64.0.0/10、fd7a:115c:a1e0::/48),同網段/公用網路一律 403。
+#   ⚠️ API 沒有登入驗證、派遣的冒險者能跑指令 —— 只在你信任 tailnet 上所有裝置時開啟。
+tailscale: false
+# 你的 MagicDNS 主機名(例:my-pc.tailxxxx.ts.net),啟動時會印出連線網址;可留空
+tailscale_hostname: ""
+
 # ── 派遣 ─────────────────────────────────────────────
 dispatch_parallel: 2          # 同時最多幾張派遣(同資料夾永遠只跑一張);太多會耗盡 Windows 桌面堆
 dispatch_model: ""            # 預設派遣模型;空 = claude CLI 預設

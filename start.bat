@@ -22,8 +22,7 @@ echo Waiting for services to boot ...
 timeout /t 6 >nul
 start "" "http://localhost:5173"
 
-REM machine-specific extras (e.g. Tailscale addresses) live in start.local.bat (git-ignored)
-if exist "%~dp0start.local.bat" call "%~dp0start.local.bat"
+REM remote access (Tailscale) is configured in config.yaml; the frontend window prints the URL
 
 REM no pause -> this launcher window closes itself (one less window to babysit).
 REM Two minimized consoles remain in the taskbar; run stop.bat to close both.

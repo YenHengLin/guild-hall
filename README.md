@@ -65,6 +65,26 @@ cd web && npm install && npm run dev
 | `projects_dir` | `~/projects` | 訓練所 script 落地根目錄 |
 | `memory_dir` | `~/.claude/memory` | 訓練所 memory 落地目錄 |
 | `acceptance` | `true` | DONE 時是否跑櫃台驗收 |
+| `tailscale` | `false` | 讓 tailnet 上的裝置連前端(見下方「遠端連線」) |
+| `tailscale_hostname` | `""` | MagicDNS 主機名,啟動時印出連線網址 |
+
+### 遠端連線(Tailscale)
+
+預設前端只聽 `127.0.0.1`,其他電腦連不進來。想用手機 / 筆電透過 [Tailscale](https://tailscale.com)
+連,在 `config.yaml` 設:
+
+```yaml
+tailscale: true
+tailscale_hostname: 'my-pc.tailxxxx.ts.net'   # 可留空;`tailscale status` 查得到
+```
+
+重啟前端後,前端視窗會印出 `Tailscale: http://my-pc.tailxxxx.ts.net:5173`。
+
+- 此時前端綁 `0.0.0.0`,但**只放行本機與 Tailscale 位址**(`100.64.0.0/10`、`fd7a:115c:a1e0::/48`);
+  同網段、ZeroTier、公用網路來的連線一律 403。
+- 後端(8848)永遠只聽 `127.0.0.1`,只經由前端 proxy 轉發。
+- 連不進來時:Windows 防火牆要允許 node.exe(建議只對 Tailscale 網段放行)。
+- ⚠️ API **沒有登入驗證**,而派遣的冒險者能執行指令 —— 只在你信任 tailnet 上所有裝置時開啟。
 
 ---
 
@@ -187,9 +207,6 @@ tests/              pytest
 config.example.yaml 設定範本
 start.bat / stop.bat Windows 啟動 / 關閉
 ```
-
-本機專屬的啟動附加步驟(例如印出 Tailscale 位址)可放 `start.local.bat`(不進 git),
-`start.bat` 會自動呼叫。
 
 ## 開發
 
