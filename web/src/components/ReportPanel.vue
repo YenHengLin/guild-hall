@@ -4,10 +4,14 @@ import Heatmap from './Heatmap.vue'
 import CommissionReport from './CommissionReport.vue'
 import { useGuildStore } from '../stores/guild'
 import { shortTokens } from '../labels'
+import { useFloatingPanel } from '../composables/useFloatingPanel'
 
 const props = defineProps({ report: Object, queue: Object })
 const emit = defineEmits(['close'])
 const store = useGuildStore()
+
+// 可拖曳(抓標題列)+ 可縮放(CSS resize)的浮動視窗
+const { floating, onDragStart, panelStyle } = useFloatingPanel()
 
 const reports = computed(() => props.queue?.recent || [])
 const OUTCOME = { success: '✅', partial: '🟡', failed: '❌' }
@@ -15,7 +19,6 @@ const STATUS_TXT = {
   pending: '⏳ 待處理', processing: '⚙️ 處理中', done: '🗂 已歸檔', failed: '⚠️ 失敗',
 }
 const REVIEW_BADGE = {
-  approved: { t: '✅ 已認可', c: 'rev-ok' },
   rejected: { t: '↩️ 已退回', c: 'rev-no' },
 }
 
@@ -58,11 +61,16 @@ function fmtUsd(v) {
 </script>
 
 <template>
-  <div class="report-backdrop" @click.self="emit('close')">
-    <div class="report">
-      <button class="report__close" @click="emit('close')">✕</button>
-      <h2>📊 公會戰報</h2>
+  <div class="report-backdrop" :class="{ 'report-backdrop--free': floating }" @click.self="emit('close')">
+    <div class="report fpanel" :class="{ 'fpanel--free': floating }" :style="panelStyle()">
+      <div class="report__bar" @pointerdown="onDragStart($event, '.report')"
+           title="拖曳可移動;抓右下角可縮放視窗">
+        <h2>📊 公會戰報</h2>
+        <span class="report__drag-hint">⠿ 可拖曳 · 右下角可縮放</span>
+        <button class="report__close" @click="emit('close')">✕</button>
+      </div>
 
+      <div class="report__scroll">
       <!-- 今日 / 本週數字 -->
       <div class="report__cards">
         <div class="rcard">
@@ -241,6 +249,7 @@ function fmtUsd(v) {
           </div>
         </div>
       </div>
+      </div><!-- /.report__scroll -->
     </div>
   </div>
 </template>

@@ -131,14 +131,23 @@ def _run_claude(prompt: str) -> dict:
 
 
 def _extract_json(text: str) -> dict | None:
-    """從模型輸出撈出第一個完整 JSON 物件(模型偶爾會包 ```json)。"""
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    """從模型輸出撈出第一個完整 JSON 物件(模型偶爾會包 ```json 或夾雜說明文字)。
+
+    不用貪心 `\\{.*\\}`:那會從第一個 `{` 吃到最後一個 `}`,一旦輸出裡有多個
+    JSON 片段或前後說明文字,就會抓到整段非法字串而靜默丟棄結果。改用
+    `raw_decode()` 從每個 `{` 起點嘗試解析,回傳第一個能成功解析的 JSON 物件。
+    """
+    decoder = json.JSONDecoder()
+    for idx in range(len(text)):
+        if text[idx] != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 def _default_artifact_path(route: str, name: str, guild: str | None) -> str:

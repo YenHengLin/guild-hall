@@ -450,6 +450,8 @@ def scan_guilds() -> list[Guild]:
 
     # 有冒險中的公會排前,其次依冒險者數
     guilds.sort(key=lambda g: (-g.active_count, -g.adventurer_count))
+    # 全量掃描已走過所有現存檔案,順手清掉快取裡已刪除的 session 路徑
+    cache.prune_missing()
     return guilds
 
 

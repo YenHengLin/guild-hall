@@ -48,6 +48,10 @@ def _row(r) -> Commission:
         klass=r["klass"] if "klass" in keys else None,
         cost=r["cost"] or 0.0 if "cost" in keys else 0.0,
         images=_images(r, keys),
+        domain=r["domain"] if "domain" in keys else None,
+        self_folder=bool(r["self_folder"]) if "self_folder" in keys else False,
+        memory=r["memory"] if "memory" in keys else None,
+        task_memory=bool(r["task_memory"]) if "task_memory" in keys else False,
     )
 
 
@@ -79,16 +83,39 @@ def create_commission(body: CommissionPost) -> Commission:
                             json.dumps(imgs, ensure_ascii=False) if imgs else None)
     extra = {k: v for k, v in
              {"goal": body.goal, "cwd": body.cwd, "model": body.model,
-              "klass": body.klass}.items() if v}
+              "klass": body.klass, "domain": body.domain}.items() if v}
+    if body.self_folder:
+        extra["self_folder"] = 1
+    if body.task_memory:
+        extra["task_memory"] = 1
     if extra:
         db.update_commission(cid, **extra)
     return _get(cid)
 
 
+@router.get("/domains")
+def list_domains() -> list[str]:
+    """既有領域公會名稱(供前端 datalist 建議)。"""
+    return db.list_domains()
+
+
 @router.patch("/commissions/{cid}", response_model=Commission)
 def patch_commission(cid: int, body: CommissionPatch) -> Commission:
-    """中途調整:改目標 / 標題 / 備註。派遣執行中改 goal,下一回合即生效。"""
-    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    """中途調整 / 整張重編:標題 / 目標 / 備註 / 皮膚 / 附圖。
+
+    只處理「有送來」的欄位(exclude_unset);派遣執行中改 goal,下一回合即生效。
+    images 送空陣列代表清空附圖;未送則不動。
+    """
+    data = body.model_dump(exclude_unset=True)
+    fields: dict = {}
+    for k, v in data.items():
+        if k == "images":
+            imgs = [u for u in (v or []) if isinstance(u, str) and u.startswith("/uploads/")]
+            fields["images"] = json.dumps(imgs, ensure_ascii=False) if imgs else None
+        elif k in ("self_folder", "task_memory") and v is not None:
+            fields[k] = 1 if v else 0
+        elif v is not None:
+            fields[k] = v
     if fields:
         db.update_commission(cid, **fields)
         if "goal" in fields:
@@ -106,14 +133,16 @@ async def dispatch_commission(cid: int, body: DispatchReq) -> Commission:
         raise HTTPException(status_code=409, detail="這張委託已在執行中")
     if c.status == "done":
         raise HTTPException(status_code=409, detail="委託已完成;要重做請先取消完成")
-    if dispatch.is_busy():
-        raise HTTPException(status_code=409, detail="已有其他派遣進行中,請稍候")
     if body.cwd:
         db.update_commission(cid, cwd=body.cwd)
     elif not c.cwd:
         raise HTTPException(status_code=400, detail="請先指定工作資料夾(公會)")
     if body.model is not None:
         db.update_commission(cid, model=body.model or None)
+    # 並行派遣:滿位或同資料夾已有派遣在跑 → 擋下(建議改排隊或勾自建資料夾)
+    reason = dispatch.block_reason(db.get_commission(cid))
+    if reason:
+        raise HTTPException(status_code=409, detail=reason)
     task = asyncio.create_task(dispatch.run_dispatch(cid))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -122,7 +151,7 @@ async def dispatch_commission(cid: int, body: DispatchReq) -> Commission:
 
 @router.post("/commissions/{cid}/enqueue", response_model=Commission)
 async def enqueue_commission(cid: int, body: DispatchReq) -> Commission:
-    """把委託加入派遣佇列;背景 worker 會依序自動執行(可一次排多張)。"""
+    """把委託加入派遣佇列;背景 worker 有空位就自動執行(不同資料夾並行)。"""
     c = _get(cid)
     if not dispatch.available():
         raise HTTPException(status_code=503, detail="找不到 claude CLI")

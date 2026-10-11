@@ -3,9 +3,9 @@ import {
   fetchGuilds, fetchAdventurer, fetchReport, submitReport, polishReport, fetchQueue,
   fetchLessons, reclassifyLessons,
   fetchEvolutions, submitEvolution,
-  fetchCommissions, postCommission, completeCommission, reopenCommission,
+  fetchCommissions, fetchDomains, postCommission, completeCommission, reopenCommission,
   deleteCommission, hideAdventurer, fetchActivity,
-  approveReport, rejectReport, addAbility, removeAbility, setIdentity,
+  rejectReport, addAbility, removeAbility, setIdentity,
   patchCommission, dispatchCommission, enqueueCommission, steerCommission, stopCommission,
   fetchCommissionEvents, trainAdventurer, distillGuild, fetchProposals,
   approveProposal, rejectProposal, fetchCosts,
@@ -21,6 +21,7 @@ export const useGuildStore = defineStore('guild', {
     queue: null, // 櫃台回報佇列
     evolutions: [], // 冒險者進化候選 / 已習得能力
     commissions: [], // 使用者自己貼的委託
+    domains: [], // 既有領域公會名稱(供表單建議)
     costs: null, // 成本帳本:{ total, months:[{month,total,sources}] }
     proposals: [], // 訓練所進化提案(pending 在前)
     training: false, // 訓練所分析進行中(跑 claude)
@@ -123,6 +124,7 @@ export const useGuildStore = defineStore('guild', {
         this.proposals = proposals
         this.costs = costs
         this.museIdeas = museIdeas
+        if (!this.domains.length) this.loadDomains()
         this.error = null
         this.lastUpdated = new Date()
       } catch (e) {
@@ -201,10 +203,14 @@ export const useGuildStore = defineStore('guild', {
       try {
         const created = await postCommission(payload)
         this.commissions = await fetchCommissions()
+        this.loadDomains() // 可能有新領域公會
         return created // 含 id,供「貼上並立即派遣」接著派工
       } catch (e) {
         return null
       }
+    },
+    async loadDomains() {
+      try { this.domains = await fetchDomains() } catch (e) { /* 靜默 */ }
     },
     async toggleCommission(c) {
       if (c.status === 'done') await reopenCommission(c.id)
@@ -283,6 +289,16 @@ export const useGuildStore = defineStore('guild', {
     async updateGoal(id, goal) {
       await patchCommission(id, { goal })
       this.commissions = await fetchCommissions()
+    },
+    // 整張委託重新編輯:標題 / 目標 / 備註 / 位階 / 皮膚 / 附圖一次更新
+    async updateCommission(id, payload) {
+      try {
+        const updated = await patchCommission(id, payload)
+        this.commissions = await fetchCommissions()
+        return updated
+      } catch (e) {
+        return null
+      }
     },
     loadEvents(id) {
       return fetchCommissionEvents(id)
@@ -426,11 +442,7 @@ export const useGuildStore = defineStore('guild', {
       this.personaQuests = persona.quests || []
       this.openAdventurer(persona.lead_id, true)
     },
-    // ── 報告審核(使用者當幕後審核）──
-    async reviewApprove(id) {
-      await approveReport(id)
-      this.queue = await fetchQueue()
-    },
+    // ── 報告審核(使用者當幕後審核;認可對 AI 無作用已移除,只留退回重寫)──
     async reviewReject(id, note) {
       await rejectReport(id, note)
       this.queue = await fetchQueue()

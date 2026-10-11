@@ -140,6 +140,9 @@ def process_report(row) -> tuple[str, str]:
     # 教學卡是自足的學習成品:不寫工作回報 wiki、不跑櫃檯合成(省 token),直接完成。
     if _card_kind(row) == "teaching":
         return "done", None
+    # 記憶特化:成果已存進委託自己的任務記憶,不寫 llm wiki、不跑合成(wiki 不再被灌爆)
+    if "to_wiki" in row.keys() and row["to_wiki"] == 0:
+        return "done", "🧠 已存入任務記憶(未寫入 llm wiki)"
     guild = row["guild"] or "未知公會"
     title = row["title"] or "無題回報"
     today = date.today().strftime("%Y-%m-%d")

@@ -3,6 +3,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useGuildStore } from '../stores/guild'
 import { relativeTime } from '../labels'
 import Markdown from './Markdown.vue'
+import ModelPicker from './ModelPicker.vue'
 
 const emit = defineEmits(['close'])
 const store = useGuildStore()
@@ -20,14 +21,70 @@ const IMPACT_META = {
   中: { label: '影響中', cls: 'idea__impact--mid' },
   低: { label: '影響小', cls: 'idea__impact--lo' },
 }
-const MODEL_OPTS = [
-  { value: 'claude-haiku-4-5-20251001', label: '🥉 Haiku(省)' },
-  { value: 'claude-sonnet-4-6', label: '🥈 Sonnet(預設)' },
-  { value: 'claude-opus-4-8', label: '🥇 Opus(最強)' },
-]
-
 const newIdeas = computed(() => store.museIdeas.filter((i) => i.status === 'new'))
 const handled = computed(() => store.museIdeas.filter((i) => i.status !== 'new'))
+
+// 每座公會「走到哪」:把所有靈感(含已處理)依公會統計 已採納/略過/待處理,
+// 讓分支像技能樹節點一樣顯示進度——這座公會你已經推進了多少、還剩多少沒看。
+const guildProgress = computed(() => {
+  const by = {}
+  for (const i of store.museIdeas) {
+    const g = i.guild || '未知公會'
+    const p = (by[g] ||= { promoted: 0, dismissed: 0, new: 0, total: 0 })
+    if (i.status === 'promoted') p.promoted++
+    else if (i.status === 'dismissed') p.dismissed++
+    else p.new++
+    p.total++
+  }
+  for (const g in by) {
+    const p = by[g]
+    // 進度 = 已處理(採納+略過)占比;採納才是「真的往前走」,略過只是清掉
+    p.done = p.promoted + p.dismissed
+    p.pct = p.total ? Math.round((p.done / p.total) * 100) : 0
+  }
+  return by
+})
+
+// 把一整排扁平靈感依「公會(= 對誰優化)」收攏成分支,讓長清單變成一眼看得懂的樹:
+// 每個分支標題直接標出「這座公會幾張 · 幾高幾中幾低」,主人掃一眼就知道主體與輕重。
+const IMPACT_ORDER = { 高: 0, 中: 1, 低: 2 }
+const newGroups = computed(() => {
+  const by = new Map()
+  for (const i of newIdeas.value) {
+    const key = i.guild || '未知公會'
+    if (!by.has(key)) by.set(key, [])
+    by.get(key).push(i)
+  }
+  const groups = []
+  for (const [guild, ideas] of by) {
+    const impact = { 高: 0, 中: 0, 低: 0 }
+    for (const i of ideas) if (impact[i.impact] != null) impact[i.impact]++
+    // 分支內的卡片也依影響高→低排,最值得做的先看到
+    ideas.sort((a, b) => (IMPACT_ORDER[a.impact] ?? 3) - (IMPACT_ORDER[b.impact] ?? 3))
+    groups.push({
+      guild, ideas, impact, kinds: groupByKind(ideas),
+      score: impact.高 * 100 + impact.中 * 10 + impact.低,
+    })
+  }
+  // 影響大的、張數多的公會排最前
+  groups.sort((a, b) => b.score - a.score || b.ideas.length - a.ideas.length)
+  return groups
+})
+
+// 分支內的第二層:依 kind(改善/bug/效能/UX…)分類成小節,這就是「分類」本身。
+// 每個小節標出「這類幾張」,讓主人一眼看出這座公會的優化落在哪些領域、各領域輕重。
+const KIND_ORDER = ['bug', 'perf', 'ux', 'improve', 'refactor', 'test', 'doc', 'idea']
+function groupByKind(ideas) {
+  const by = new Map()
+  for (const i of ideas) {
+    const k = KIND_META[i.kind] ? i.kind : 'idea'
+    if (!by.has(k)) by.set(k, [])
+    by.get(k).push(i)
+  }
+  return [...by.entries()]
+    .map(([kind, items]) => ({ kind, meta: KIND_META[kind], items }))
+    .sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind))
+}
 const meta = computed(() => store.museConfig || {})
 const prog = computed(() => store.museStatus || {})
 
@@ -118,9 +175,7 @@ async function promote(i) {
             <input type="number" min="1" max="6" v-model.number="form.ideas_per_run" />
           </label>
           <label>位階
-            <select v-model="form.model">
-              <option v-for="o in MODEL_OPTS" :key="o.value" :value="o.value">{{ o.label }}</option>
-            </select>
+            <ModelPicker v-model="form.model" title="夜巡用哪個模型" />
           </label>
           <button class="btn-primary" :disabled="saving" @click="save">
             {{ saving ? '儲存中…' : (saved ? '✓ 已儲存' : '💾 儲存設定') }}
@@ -195,39 +250,67 @@ async function promote(i) {
         <div v-if="!newIdeas.length" class="board__empty">
           還沒有新靈感。開啟自動夜巡並等到設定的時段,或按「🔦 立即巡一輪」馬上試。
         </div>
-        <div v-for="i in newIdeas" :key="i.id" class="idea">
-          <div class="idea__head">
-            <span class="idea__kind">{{ (KIND_META[i.kind] || KIND_META.idea).icon }}
-              {{ (KIND_META[i.kind] || KIND_META.idea).label }}</span>
-            <span v-if="i.impact && IMPACT_META[i.impact]"
-                  class="idea__impact" :class="IMPACT_META[i.impact].cls">
-              {{ IMPACT_META[i.impact].label }}
+        <!-- 技能樹分支:一座公會 = 一條分支。標題列一眼看出對誰優化、有幾張、輕重分布 -->
+        <details v-for="g in newGroups" :key="g.guild" class="branch" open>
+          <summary class="branch__head">
+            <span class="branch__name">🏰 {{ g.guild }}</span>
+            <span class="branch__count">{{ g.ideas.length }} 張待處理</span>
+            <span class="branch__impacts">
+              <span v-if="g.impact.高" class="idea__impact idea__impact--hi">{{ g.impact.高 }} 影響大</span>
+              <span v-if="g.impact.中" class="idea__impact idea__impact--mid">{{ g.impact.中 }} 影響中</span>
+              <span v-if="g.impact.低" class="idea__impact idea__impact--lo">{{ g.impact.低 }} 影響小</span>
             </span>
-            <b class="idea__title">{{ i.title }}</b>
+          </summary>
+          <!-- 「走到哪」進度軸:這座公會已採納/略過/待處理,像技能樹節點的點亮進度 -->
+          <div v-if="guildProgress[g.guild]" class="branch__prog">
+            <div class="branch__bar" :title="`已採納 ${guildProgress[g.guild].promoted}、略過 ${guildProgress[g.guild].dismissed}、待處理 ${guildProgress[g.guild].new}`">
+              <span class="branch__bar-fill" :style="{ width: guildProgress[g.guild].pct + '%' }"></span>
+            </div>
+            <span class="branch__prog-text">
+              走到 {{ guildProgress[g.guild].pct }}%
+              · 🎫 採納 {{ guildProgress[g.guild].promoted }}
+              · 🙈 略過 {{ guildProgress[g.guild].dismissed }}
+              · 待辦 {{ guildProgress[g.guild].new }}
+            </span>
           </div>
-          <!-- 白話一句話:醒目呈現,主人一眼掃懂發現了什麼 -->
-          <div v-if="i.headline" class="idea__headline">
-            <span class="idea__headline-mark">👀 發現</span>{{ i.headline }}
+          <!-- 第二層:分類小節(改善/bug/效能/UX…)= 「這座公會的優化落在哪些領域」 -->
+          <div v-for="sec in g.kinds" :key="sec.kind" class="twig">
+            <div class="twig__head">
+              <span class="twig__kind">{{ sec.meta.icon }} {{ sec.meta.label }}</span>
+              <span class="twig__count">{{ sec.items.length }}</span>
+            </div>
+          <div v-for="i in sec.items" :key="i.id" class="idea">
+            <div class="idea__head">
+              <span v-if="i.impact && IMPACT_META[i.impact]"
+                    class="idea__impact" :class="IMPACT_META[i.impact].cls">
+                {{ IMPACT_META[i.impact].label }}
+              </span>
+              <b class="idea__title">{{ i.title }}</b>
+            </div>
+            <!-- 白話一句話:醒目呈現,主人一眼掃懂發現了什麼 -->
+            <div v-if="i.headline" class="idea__headline">
+              <span class="idea__headline-mark">👀 發現</span>{{ i.headline }}
+            </div>
+            <!-- 建議的下一步:白話、可直接開工 -->
+            <div v-if="i.next_step" class="idea__next">
+              <span class="idea__next-mark">➡️ 下一步</span>{{ i.next_step }}
+            </div>
+            <div class="idea__meta">
+              <template v-if="i.effort">工作量 {{ EFFORT[i.effort] || i.effort }}</template>
+              <template v-if="i.created_at"> · {{ relativeTime(i.created_at) }}</template>
+            </div>
+            <details v-if="i.body" class="idea__more">
+              <summary class="idea__more-t">📋 技術細節</summary>
+              <Markdown :text="i.body" class="idea__body" />
+            </details>
+            <div class="idea__actions">
+              <button class="btn-primary" @click="promote(i)">🎫 採納成委託</button>
+              <button class="btn-ghost" @click="store.dismissIdea(i.id)">🙈 略過</button>
+              <button class="btn-ghost" @click="store.removeIdea(i.id)">🗑 刪除</button>
+            </div>
           </div>
-          <!-- 建議的下一步:白話、可直接開工 -->
-          <div v-if="i.next_step" class="idea__next">
-            <span class="idea__next-mark">➡️ 下一步</span>{{ i.next_step }}
           </div>
-          <div class="idea__meta">
-            🏰 {{ i.guild || '?' }}
-            <template v-if="i.effort"> · 工作量 {{ EFFORT[i.effort] || i.effort }}</template>
-            <template v-if="i.created_at"> · {{ relativeTime(i.created_at) }}</template>
-          </div>
-          <details v-if="i.body" class="idea__more">
-            <summary class="idea__more-t">📋 技術細節</summary>
-            <Markdown :text="i.body" class="idea__body" />
-          </details>
-          <div class="idea__actions">
-            <button class="btn-primary" @click="promote(i)">🎫 採納成委託</button>
-            <button class="btn-ghost" @click="store.dismissIdea(i.id)">🙈 略過</button>
-            <button class="btn-ghost" @click="store.removeIdea(i.id)">🗑 刪除</button>
-          </div>
-        </div>
+        </details>
       </div>
 
       <!-- 已處理 -->
@@ -245,6 +328,76 @@ async function promote(i) {
 </template>
 
 <style scoped>
+/* 技能樹分支:一座公會收攏成一條可收合的枝幹,左側一道金線像樹幹 */
+.branch {
+  margin: 0.5rem 0;
+  padding-left: 0.75rem;
+  border-left: 3px solid var(--border, #c9a969);
+}
+.branch[open] { border-left-color: var(--gold, #b8860b); }
+.branch__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  cursor: pointer;
+  padding: 0.3rem 0;
+  user-select: none;
+  list-style: none;
+}
+.branch__head::-webkit-details-marker { display: none; }
+.branch__head::before {
+  content: '▸';
+  color: var(--gold, #b8860b);
+  transition: transform 0.15s;
+}
+.branch[open] .branch__head::before { transform: rotate(90deg); }
+.branch__name { font-weight: 700; font-size: 1.02rem; color: var(--ink, #3a2f1d); }
+.branch__count {
+  font-size: 0.8rem;
+  color: var(--ink-soft, #6b5c42);
+  background: rgba(107, 92, 66, 0.1);
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+}
+.branch__impacts { display: inline-flex; gap: 0.3rem; margin-left: auto; }
+/* 「走到哪」進度軸:細進度條 + 文字,呈現這座公會已推進多少 */
+.branch__prog { margin: 0.1rem 0 0.4rem; }
+.branch__bar {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(107, 92, 66, 0.15);
+  overflow: hidden;
+}
+.branch__bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--gold, #b8860b);
+  border-radius: 999px;
+  transition: width 0.3s;
+}
+.branch__prog-text {
+  display: inline-block;
+  margin-top: 0.2rem;
+  font-size: 0.74rem;
+  color: var(--ink-soft, #6b5c42);
+}
+/* 第二層小枝:一個分類(kind)= 一個小節,標題標出領域與張數 */
+.twig { margin: 0.35rem 0 0.35rem 0.4rem; }
+.twig__head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-bottom: 0.2rem;
+}
+.twig__kind { font-weight: 700; font-size: 0.9rem; color: var(--ink, #3a2f1d); }
+.twig__count {
+  font-size: 0.72rem;
+  color: var(--ink-soft, #6b5c42);
+  background: rgba(107, 92, 66, 0.1);
+  padding: 0 0.4rem;
+  border-radius: 999px;
+}
 /* 白話一句話:羊皮紙上最醒目的一行,主人一眼掃懂「發現了什麼」 */
 .idea__headline {
   margin: 0.4rem 0 0.15rem;

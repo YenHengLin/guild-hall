@@ -4,13 +4,19 @@
 // 認不得的 kind / 無 card → 回傳 false,由呼叫端退回 markdown 呈現。
 import CodingCard from './CodingCard.vue'
 import FlashCards from './FlashCards.vue'
+import OpsCard from './OpsCard.vue'
+import ReviewCard from './ReviewCard.vue'
+import ShipCard from './ShipCard.vue'
 
 defineProps({
   card: { type: Object, default: null },
 })
 defineEmits(['deepen'])
 
-const RENDERERS = { coding: CodingCard, teaching: FlashCards }
+const RENDERERS = {
+  coding: CodingCard, ops: OpsCard, review: ReviewCard,
+  ship: ShipCard, teaching: FlashCards,
+}
 </script>
 
 <template>

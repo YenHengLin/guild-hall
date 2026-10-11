@@ -90,6 +90,24 @@ def test_extract_markdown_fenced_json():
     assert out[0]["title"] == "改善 X"
 
 
+def test_extract_bracket_noise_prefix_before_array():
+    """陣列前夾帶含中括號的說明(夜巡 body 常寫 [連結](url)/[註])→ 仍能撈出真陣列。
+
+    貪婪 `\\[.*\\]` 會從雜訊 '[' 一路吞到最後 ']',把非 JSON 文字一起塞進
+    json.loads 導致整輪靈感靜默歸零 —— 這正是這張委託要修的坑。"""
+    text = ('這裡有一個 [連結](https://example.com) 以及 [註] 的說明。以下是靈感:\n'
+            '```json\n[{"title": "改對源頭", "kind": "bug"}]\n```')
+    out = muse._extract_ideas(text)
+    assert [d["title"] for d in out] == ["改對源頭"]
+
+
+def test_extract_bracket_noise_prefix_without_fence():
+    """即便沒有 ```json 包裹,雜訊 '[' 也要被跳過、抓到後面的真陣列。"""
+    text = '參考 [issue #12] 的討論,建議:[{"title": "補測試"}]'
+    out = muse._extract_ideas(text)
+    assert [d["title"] for d in out] == ["補測試"]
+
+
 def test_extract_empty_array():
     assert muse._extract_ideas("專案很乾淨\n[]") == []
 

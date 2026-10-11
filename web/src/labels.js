@@ -78,7 +78,9 @@ export function hashHue(str) {
   return h
 }
 
-// 依冒險者最擅長的技能推派「職業」圖示
+// 依冒險者最擅長的技能推派「職業」圖示。
+// 工程師 vs 機關師的分野:工程師寫「程式碼」(原始碼 / 演算法 / 函式庫),
+// 機關師顧「機關」(基礎設施 / 服務 / 容器 / 硬體透傳 —— 動的是環境與系統,不是 app 原始碼)。
 const CLASS_RULES = [
   [/rust|cargo|clippy/i, { icon: '⚙️', klass: '工程師' }],
   [/web|front|react|vue|playwright|css|design|frontend/i, { icon: '🎨', klass: '術士' }],
@@ -108,40 +110,80 @@ export function classOf(adventurer) {
   return { icon: '🗡️', klass: '冒險者' }
 }
 
-// 所有可手動指定的職業(供冒險者頁的職業選單)
+// 所有可手動指定的職業(供冒險者頁的職業選單)。
+// desc 一句話講清楚「這職業在幹嘛」—— 解決使用者「工程師跟機關師到底差在哪」的困惑。
 export const CLASSES = [
-  { klass: '工程師', icon: '⚙️' },
-  { klass: '術士', icon: '🎨' },
-  { klass: '鑑定師', icon: '🧪' },
-  { klass: '書記官', icon: '📚' },
-  { klass: '機關師', icon: '🔧' },
-  { klass: '斥候', icon: '🌿' },
-  { klass: '預言家', icon: '🔮' },
-  { klass: '冒險者', icon: '🗡️' },
+  { klass: '工程師', icon: '⚙️', desc: '寫程式碼:原始碼、演算法、函式庫' },
+  { klass: '術士', icon: '🎨', desc: '前端畫面:網頁、元件、樣式設計' },
+  { klass: '鑑定師', icon: '🧪', desc: '品質把關:測試、驗證、程式審查' },
+  { klass: '書記官', icon: '📚', desc: '文件教學:整理知識、產教學字卡' },
+  { klass: '機關師', icon: '🔧', desc: '顧機關:基礎設施、容器、服務、硬體' },
+  { klass: '斥候', icon: '🌿', desc: '出貨:git、部署、推送上線' },
+  { klass: '預言家', icon: '🔮', desc: '資料預測:API、數據、股價模型' },
+  { klass: '冒險者', icon: '🗡️', desc: '通用:什麼都能接的萬用職' },
 ]
 export function iconForClass(klass) {
   return (CLASSES.find((c) => c.klass === klass) || { icon: '🗡️' }).icon
 }
 
+// ── 解決的問題分類 ──────────────────────────────────────
+// 完成卡上標「這到底解決了哪一類問題」,讓已完成的項目一眼看出類型、可被歸類。
+// slug 為單一來源;後端 dispatch.py 的 _CODING_CATEGORIES 需與這份 key 一致。
+export const PROBLEM_KINDS = {
+  bugfix: { icon: '🐛', label: '修 Bug', color: '#d2544b' },
+  feature: { icon: '✨', label: '新功能', color: '#3f9142' },
+  refactor: { icon: '♻️', label: '重構', color: '#2f8fb3' },
+  perf: { icon: '⚡', label: '效能', color: '#d99b16' },
+  config: { icon: '⚙️', label: '設定/環境', color: '#8a7f6a' },
+  docs: { icon: '📝', label: '文件', color: '#7a6cc4' },
+  test: { icon: '🧪', label: '測試', color: '#4a9b8e' },
+  ui: { icon: '🎨', label: '介面', color: '#c45fa0' },
+  chore: { icon: '🧹', label: '雜務', color: '#9a9488' },
+  other: { icon: '📦', label: '其他', color: '#8a8a8a' },
+}
+// 取分類的顯示資料;認不得的 slug / 空值 → 回 null(呼叫端不渲染徽章)
+export function problemKind(slug) {
+  return (slug && PROBLEM_KINDS[slug]) || null
+}
+
+// 鑑定師查驗總裁決(與後端 dispatch.py 的 _VERDICT_WORDS 值一致)
+export const VERDICT_META = {
+  pass: { icon: '✅', label: '通過', color: '#3f9142' },
+  warn: { icon: '⚠️', label: '有疑慮', color: '#d99b16' },
+  fail: { icon: '❌', label: '未過', color: '#d2544b' },
+}
+export function verdictMeta(slug) {
+  return VERDICT_META[slug] || VERDICT_META.warn
+}
+
 // 職業 → 結果皮膚(result card kind)。沒對應的職業就用 markdown 保底(回 null)。
 const CLASS_SKIN = {
-  工程師: 'coding', 機關師: 'coding',
+  工程師: 'coding',
+  機關師: 'ops', // 機關師:指令/服務皮膚(與工程師的 code diff 區隔)
+  鑑定師: 'review', // 鑑定師:查驗清單 + 裁決皮膚
+  斥候: 'ship', // 斥候:出貨(commit/推送/部署)皮膚
   書記官: 'teaching',
 }
 export function skinForClass(klass) {
   return CLASS_SKIN[klass] || null
 }
 
-// 冒險者位階:派遣時用的模型(強弱 vs 花費的取捨)
+// 冒險者位階:派遣時用的模型(強弱 vs 花費的取捨)。
+// 這是「位階 → 模型」的單一來源:布告欄三處派遣選單 + 夜巡設定都吃這份,
+// 改這裡就全站同步(別再另開重複清單)。值就是 claude CLI `--model` 吃的字串
+// (完整名或 alias 皆可);rankOf 對清單外的任意模型字串也能優雅顯示。
+export const CUSTOM_RANK = '__custom__' // 自訂模型哨兵值(選它會跳出輸入框打任意模型)
 export const RANKS = [
   { value: '', label: '⭐ 預設位階(跟隨 CLI 設定)', short: '⭐' },
   { value: 'claude-haiku-4-5-20251001', label: '🥉 銅牌冒險者(haiku,快又省)', short: '🥉' },
   { value: 'claude-sonnet-4-6', label: '🥈 銀牌冒險者(sonnet,均衡)', short: '🥈' },
-  { value: 'claude-opus-4-8', label: '🥇 金牌冒險者(opus,最強最貴)', short: '🥇' },
+  { value: 'claude-opus-4-8', label: '🥇 金牌冒險者(opus,最強)', short: '🥇' },
+  { value: 'claude-fable-5', label: '📖 說書人(fable,敘事特化)', short: '📖' },
+  { value: CUSTOM_RANK, label: '✍️ 自訂模型…(填任何 cloud 模型名)', short: '✍️' },
 ]
 export function rankOf(model) {
   return RANKS.find((r) => r.value === (model || '')) ||
-    { value: model, label: model, short: '❓' }
+    { value: model, label: model, short: '🎖' }
 }
 
 // 位階自動建議:依委託關鍵字 + 篇幅,粗略推薦一個派遣位階(使用者可覆寫)。

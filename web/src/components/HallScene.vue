@@ -1,6 +1,5 @@
 <script setup>
 import NoticeBoard from './NoticeBoard.vue'
-import ReceptionDesk from './ReceptionDesk.vue'
 import GuildStation from './GuildStation.vue'
 
 defineProps({ guilds: Array, report: Object, queue: Object, commissions: Array })
@@ -9,7 +8,7 @@ const emit = defineEmits(['open', 'openReport'])
 
 <template>
   <div class="room">
-    <!-- 後牆:掛布告欄 + 櫃檯 -->
+    <!-- 後牆:掛布告欄(櫃台已移到側邊欄)-->
     <div class="room__wall">
       <NoticeBoard
         :quests="report?.quests || []"
@@ -17,7 +16,6 @@ const emit = defineEmits(['open', 'openReport'])
         :queue="queue"
         @open="(id) => emit('open', id)"
       />
-      <ReceptionDesk :report="report" :queue="queue" @open="emit('openReport')" />
     </div>
 
     <!-- 地板:各公會的站台 -->
@@ -27,6 +25,7 @@ const emit = defineEmits(['open', 'openReport'])
         <GuildStation
           v-for="g in guilds"
           :key="g.dir_key"
+          :id="'station-' + g.dir_key"
           :guild="g"
           @open="(id) => emit('open', id)"
         />

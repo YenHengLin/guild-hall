@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, computed } from 'vue'
 import { useGuildStore } from './stores/guild'
 import HallScene from './components/HallScene.vue'
+import ReceptionSidebar from './components/ReceptionSidebar.vue'
 import AdventurerDrawer from './components/AdventurerDrawer.vue'
 import ReportPanel from './components/ReportPanel.vue'
 import TrainingHall from './components/TrainingHall.vue'
@@ -68,19 +69,26 @@ onUnmounted(() => { store.stopPolling(); store.stopMusePolling() })
       </div>
     </div>
 
-    <div v-if="store.error" class="err">⚠️ {{ store.error }}(後端是否已啟動於 :8848?)</div>
-    <div v-else-if="store.loading" class="empty">📜 公會名冊召集中…</div>
-    <div v-else-if="store.guilds.length === 0" class="empty">目前沒有任何公會活動紀錄</div>
+    <div class="hall__body">
+      <div class="hall__main">
+        <div v-if="store.error" class="err">⚠️ {{ store.error }}(後端是否已啟動於 :8848?)</div>
+        <div v-else-if="store.loading" class="empty">📜 公會名冊召集中…</div>
+        <div v-else-if="store.guilds.length === 0" class="empty">目前沒有任何公會活動紀錄</div>
 
-    <HallScene
-      v-else
-      :guilds="store.guilds"
-      :report="store.report"
-      :queue="store.queue"
-      :commissions="store.commissions"
-      @open="store.open"
-      @open-report="store.openReport"
-    />
+        <HallScene
+          v-else
+          :guilds="store.guilds"
+          :report="store.report"
+          :queue="store.queue"
+          :commissions="store.commissions"
+          @open="store.open"
+          @open-report="store.openReport"
+        />
+      </div>
+
+      <!-- 可收合的櫃台側邊欄(收合時任務區滿版)-->
+      <ReceptionSidebar v-if="!store.loading && !store.error && store.guilds.length" />
+    </div>
 
     <!-- 冒險者細節抽屜 -->
     <AdventurerDrawer

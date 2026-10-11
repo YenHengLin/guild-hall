@@ -25,7 +25,6 @@ export const fetchLessons = () => http.get('/lessons').then((r) => r.data)
 // 整理書架:替未分類 / 缺延伸主題的卡補上(跑便宜模型,較久)
 export const reclassifyLessons = () =>
   http.post('/lessons/reclassify', {}, RECALL_TO).then((r) => r.data)
-export const approveReport = (id) => http.post(`/reports/${id}/approve`).then((r) => r.data)
 export const rejectReport = (id, note) =>
   http.post(`/reports/${id}/reject`, { note }).then((r) => r.data)
 export const fetchEvolutions = () => http.get('/evolutions').then((r) => r.data)
@@ -42,6 +41,7 @@ export const uploadImage = (dataUrl) =>
   http.post('/uploads', { data_url: dataUrl }).then((r) => r.data.url)
 
 export const fetchCommissions = () => http.get('/commissions').then((r) => r.data)
+export const fetchDomains = () => http.get('/domains').then((r) => r.data)
 export const fetchCosts = () => http.get('/costs').then((r) => r.data)
 export const postCommission = (payload) => http.post('/commissions', payload).then((r) => r.data)
 export const completeCommission = (id) => http.post(`/commissions/${id}/done`).then((r) => r.data)

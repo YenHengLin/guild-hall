@@ -33,7 +33,24 @@ PROMPT = """你是學習書架的整理員。以下是一份教學卡,請做兩�
 {fronts}
 """
 
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _extract_obj(text: str) -> dict | None:
+    """撈第一個能解析的 JSON 物件。容忍 ```json 包裹、以及物件前夾帶含 '{' 的
+    雜訊——用 raw_decode 對每個候選起點嘗試,雜訊會被跳過而非像貪婪 `\\{.*\\}`
+    那樣從第一個 '{' 吞到最後一個 '}' 整段解析失敗。找不到回 None。"""
+    candidates = [m.group(1).strip()
+                  for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)]
+    candidates += [text[i:] for i, ch in enumerate(text) if ch == "{"]
+    for c in candidates:
+        try:
+            obj, _ = _JSON_DECODER.raw_decode(c)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 def available() -> bool:
@@ -74,13 +91,9 @@ def classify(headline: str | None, fronts: list[str], categories: list[str]) -> 
     except json.JSONDecodeError:
         pass
 
-    m = _JSON_RE.search(text)
-    if not m:
+    obj = _extract_obj(text)
+    if obj is None:
         return {"ok": False, "error": "無法解析整理結果", "cost": cost}
-    try:
-        obj = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "整理結果 JSON 壞掉", "cost": cost}
 
     nxt = obj.get("next")
     clean_next = ([str(t).strip()[:40] for t in nxt if isinstance(t, str) and t.strip()][:3]

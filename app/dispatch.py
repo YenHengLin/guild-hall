@@ -9,7 +9,7 @@
 完成閉環:冒險者回報 DONE 時,自動把 REPORT 內容 enqueue 進櫃台佇列
 (→ 存檔 → llm-wiki-manager 深度合成),委託標記完成。
 
-護欄:一次只跑一個派遣、回合上限、單回合逾時、工具白名單(預設含 Bash,
+護欄:並行上限(GUILD_DISPATCH_PARALLEL)且同資料夾同時只跑一張、回合上限、單回合逾時、工具白名單(預設含 Bash,
 可用 GUILD_DISPATCH_TOOLS 收緊)、cwd 鎖在委託指定的公會資料夾。
 """
 
@@ -22,10 +22,10 @@ import os
 import re
 import shutil
 import subprocess
-import threading
 import time
 
 from . import db, uploads
+from .claude_run import run_stream
 from .stream_recall import _summarize_tool
 
 # 工具 → 時間線步驟圖示(讓使用者一眼看出冒險者在做什麼類型的事)
@@ -47,7 +47,11 @@ log = logging.getLogger("guild.dispatch")
 CLAUDE = shutil.which("claude") or "claude"
 MODEL = os.environ.get("GUILD_DISPATCH_MODEL", "")  # 空 = 用使用者預設模型
 MAX_ROUNDS = int(os.environ.get("GUILD_DISPATCH_ROUNDS", "6"))
-ROUND_TIMEOUT = int(os.environ.get("GUILD_DISPATCH_TIMEOUT", "600"))  # 秒/回合
+# 閒置逾時:連續這麼久「毫無任何輸出」才視為 hang 砍掉(不是牆鐘硬上限)。
+# 只要冒險者還在吐工具動作/進度就持續延長 —— 真的在跑就不會被誤砍。
+ROUND_TIMEOUT = int(os.environ.get("GUILD_DISPATCH_TIMEOUT", "600"))
+# 總時長絕對上限:防失控燒錢/無限迴圈。再怎麼「有在動」單回合也不超過這個。
+HARD_CAP = int(os.environ.get("GUILD_DISPATCH_HARD_CAP", "2400"))  # 預設 40 分
 MAX_TURNS = os.environ.get("GUILD_DISPATCH_TURNS", "25")  # claude 內部回合上限
 TOOLS = os.environ.get(
     "GUILD_DISPATCH_TOOLS", "Read,Glob,Grep,Edit,Write,Bash,WebSearch,WebFetch")
@@ -60,13 +64,57 @@ ACCEPT_MODEL = os.environ.get("GUILD_ACCEPT_MODEL", "claude-sonnet-4-6")
 MAX_REWORK = int(os.environ.get("GUILD_ACCEPTANCE_REWORK", "1"))  # 最多自動退回幾次
 ACCEPT_TIMEOUT = int(os.environ.get("GUILD_ACCEPT_TIMEOUT", "300"))
 
-# 一次只允許一個派遣在跑(本機單人場景;避免多個 headless Claude 搶資源)
-_lock = asyncio.Lock()
-_dispatch_running: bool = False  # 唯一「正在派遣」旗標;比 _lock.locked() 更安全(無 TOCTOU)
+# 自建任務資料夾的基底:並行派遣各用專屬子資料夾,避免同資料夾互卡。
+# 空 = 以委託指定的 cwd(或 home)為基底,在其下建 _tasks/<領域>/<標題-id>/。
+TASK_BASE = os.environ.get("GUILD_TASK_BASE", "")
 
-# 派遣佇列:單一背景 worker 依序抽取 status='queued' 的委託執行。
-# 使用者可一次排多張,晚上掛著,worker 自動依序跑完(醒來收成)。
+
+def _slug(s: str) -> str:
+    return (re.sub(r"[^\w\-]+", "-", str(s)).strip("-") or "x")[:40]
+
+
+def _is_task_folder(path: str, cid: int) -> bool:
+    """path 看起來已是本委託的任務資料夾(避免續派時重複往下巢狀)。"""
+    return bool(path) and "_tasks" in path and os.path.basename(path).endswith(f"-{cid}")
+
+
+def _task_folder_path(row) -> str:
+    """「自建資料夾」委託的專屬任務資料夾路徑(依 id 穩定,續派沿用;不建立)。"""
+    keys = row.keys()
+    cwd = row["cwd"] or ""
+    if _is_task_folder(cwd, row["id"]):
+        return cwd  # 續派:沿用既有任務資料夾,不再往下巢狀
+    base = TASK_BASE or cwd or os.path.join(os.path.expanduser("~"), "guild-tasks")
+    domain = (row["domain"] if "domain" in keys else None) or "general"
+    return os.path.join(base, "_tasks", _slug(domain), f"{_slug(row['title'])}-{row['id']}")
+
+
+def _make_task_folder(row) -> str:
+    folder = _task_folder_path(row)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _effective_cwd(row) -> str:
+    """派遣實際會在哪個資料夾跑(自建資料夾的委託 = 專屬任務資料夾)。"""
+    if "self_folder" in row.keys() and row["self_folder"]:
+        return _task_folder_path(row)
+    return row["cwd"] or ""
+
+
+def _folder_key(row) -> str:
+    return os.path.normcase(os.path.abspath(_effective_cwd(row) or "."))
+
+
+# 並行派遣:同時最多 PARALLEL 張(多個 headless Claude 吃 Windows 桌面堆,別開太多),
+# 且**同一資料夾同時只跑一張**(共用資料夾會互相改到檔案)—— 要並行就勾「自建資料夾」。
+PARALLEL = max(1, int(os.environ.get("GUILD_DISPATCH_PARALLEL", "2")))
+_running: dict[int, str] = {}  # 執行中委託 id → 資料夾 key
+
+# 派遣佇列:背景 worker 依 FIFO 抽取 status='queued' 的委託,有空位且資料夾沒被占就開跑。
+# 使用者可一次排多張,晚上掛著,worker 自動跑完(醒來收成)。
 _worker_task: "asyncio.Task | None" = None
+_changed: "asyncio.Event | None" = None  # 有派遣結束時叫醒 worker 補位
 
 # STATUS 行:不做行首錨定,並容許前綴反引號/粗體(模型常寫成 `STATUS: DONE — …`、
 # **STATUS: DONE**)。這是「任務能否被判定完成」的關鍵 —— 抓不到就永遠卡在回合上限。
@@ -130,7 +178,8 @@ FIRST_PROMPT = """你是冒險者公會派遣的冒險者,接下這張委託,在
 (讀 code 猜錯根因、加個防呆訊息就收工,是最常見的假修法)。重現不出來就回報 BLOCKED 問使用者。
 - 找根因而非貼 OK 繃:優先想「能不能刪掉出錯的東西 / 改對源頭」,而不是加一層 try/except 或錯誤訊息蓋住它。
 - 小步前進,每回合結束前確認改動可運作(能跑測試就跑)。
-- 不確定的重大決定不要猜,回報 BLOCKED 讓使用者用「調整指示」告訴你。
+- 不確定的重大決定不要猜:用 `AskUserQuestion` 工具把選項列清楚問使用者\
+(公會面板會把你的選項渲染成可點按鈕,使用者點一下就回覆),再回報 BLOCKED 等答覆。
 - 使用者可能在回合之間更新目標或給新指示,以最新指示為準。
 {style_directive}"""
 
@@ -267,7 +316,19 @@ def available() -> bool:
 
 
 def is_busy() -> bool:
-    return _lock.locked()
+    """是否有任何派遣在跑(夜巡據此避開忙碌時段)。"""
+    return bool(_running)
+
+
+def block_reason(row) -> str | None:
+    """這張委託現在不能開跑的原因;None = 可以跑。"""
+    if row["id"] in _running:
+        return "這張委託已在執行中"
+    if len(_running) >= PARALLEL:
+        return f"並行派遣已滿({PARALLEL} 張),請稍候或改用排隊"
+    if _folder_key(row) in _running.values():
+        return "同一資料夾已有派遣在跑(勾「自建資料夾」即可並行)"
+    return None
 
 
 def _run_round(cmd: list[str], cwd: str | None, prompt: str,
@@ -334,6 +395,22 @@ def _collect_hunk(hunks: dict[str, list[dict]], key: str, tool: str, ti: dict) -
     # NotebookEdit 結構特殊,只記檔名不取 diff
 
 
+# 機關師 ops 卡:最多記幾條指令、每條最多幾字(避免灌爆)
+_MAX_CMDS = 30
+_MAX_CMD_CHARS = 300
+
+
+def _collect_cmd(cmds: list[dict], ti: dict) -> None:
+    """客觀收集一條 Bash/PowerShell 指令(含冒險者自附的 description)供 ops 卡呈現。"""
+    if len(cmds) >= _MAX_CMDS:
+        return
+    cmd = str(ti.get("command") or "").strip()
+    if not cmd:
+        return
+    cmds.append({"cmd": cmd[:_MAX_CMD_CHARS],
+                 "desc": str(ti.get("description") or "").strip()[:120]})
+
+
 def _emit_step(cid: int | None, rnd: int | None, tool: str, summ: str) -> None:
     """把一個工具動作寫成時間線步驟(type='step')。cid 為 None(如驗收)時不寫。"""
     if cid is None:
@@ -345,98 +422,63 @@ def _emit_step(cid: int | None, rnd: int | None, tool: str, summ: str) -> None:
 
 def _stream_round(cmd: list[str], cwd: str | None, prompt: str,
                   cid: int | None, rnd: int | None) -> dict:
-    """單次執行:Popen + 逐行 stream-json。回傳含 startup_fail 供上層決定是否重試。"""
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=cwd, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
-        proc.stdin.write(prompt)  # type: ignore[union-attr]
-        proc.stdin.close()  # type: ignore[union-attr]
-    except OSError as exc:
-        return {"ok": False, "error": f"無法啟動 claude:{exc}"}
-
-    # 單回合逾時看門狗:Popen 不像 run 有 timeout,自己用 Timer 到點就 kill
-    killed = {"v": False}
-
-    def _kill() -> None:
-        killed["v"] = True
-        # Windows 的 claude.CMD 會包一層,proc.kill() 只殺外層 shim 會留孤兒 node;
-        # 用 taskkill /T 連整棵樹一起砍(和 muse 同樣的修法)。
-        try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                               capture_output=True)
-            else:
-                proc.kill()
-        except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-
-    timer = threading.Timer(ROUND_TIMEOUT, _kill)
-    timer.start()
-
-    text, sid, cost = "", None, None
-    got_result = False
+    """單次執行:走共用的 claude_run.run_stream(Popen + 逐行 stream-json + 逾時樹殺),
+    這裡只負責把工具動作寫成時間線步驟、客觀收集改動檔案 / diff。
+    回傳含 startup_fail 供上層決定是否重試。"""
     changed: set[str] = set()  # 客觀收集本回合實際改動的檔案
     hunks: dict[str, list[dict]] = {}  # 檔案 → [{before, after}] 客觀 diff(供 coding 卡)
-    try:
-        for line in proc.stdout:  # type: ignore[union-attr]
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            t = d.get("type")
-            if t == "system" and d.get("subtype") == "init":
-                sid = d.get("session_id") or sid
-            elif t == "assistant":
-                for blk in (d.get("message") or {}).get("content") or []:
-                    if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                        name = blk.get("name", "?")
-                        ti = blk.get("input") or {}
-                        _emit_step(cid, rnd, name, _summarize_tool(name, ti))
-                        if name in ("Edit", "Write", "NotebookEdit"):
-                            fp = ti.get("file_path") or ti.get("notebook_path")
-                            if fp:
-                                key = str(fp).replace("\\", "/")
-                                changed.add(key)
-                                _collect_hunk(hunks, key, name, ti)
-            elif t == "result":
-                got_result = True
-                text = (d.get("result") or d.get("text") or text).strip()
-                cost = d.get("total_cost_usd")
-                sid = d.get("session_id") or sid
-    finally:
-        timer.cancel()
-        try:
-            proc.wait(timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
+    cmds: list[dict] = []  # 客觀收集跑過的指令 [{cmd, desc}](供機關師 ops 卡)
+    asked: list[dict] = []  # 冒險者這回合用 AskUserQuestion 問的題目(含選項),供面板渲染選單
 
-    if killed["v"]:
-        return {"ok": False, "error": f"回合逾時({ROUND_TIMEOUT}s)",
-                "files": sorted(changed), "hunks": hunks}
-    if got_result:
-        return {"ok": True, "text": text, "session_id": sid, "cost": cost,
-                "files": sorted(changed), "hunks": hunks}
+    def on_event(d: dict) -> None:
+        if d.get("type") != "assistant":
+            return
+        for blk in (d.get("message") or {}).get("content") or []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                name = blk.get("name", "?")
+                ti = blk.get("input") or {}
+                _emit_step(cid, rnd, name, _summarize_tool(name, ti))
+                if name in ("Edit", "Write", "NotebookEdit"):
+                    fp = ti.get("file_path") or ti.get("notebook_path")
+                    if fp:
+                        key = str(fp).replace("\\", "/")
+                        changed.add(key)
+                        _collect_hunk(hunks, key, name, ti)
+                elif name in ("Bash", "PowerShell"):
+                    _collect_cmd(cmds, ti)
+                elif name == "AskUserQuestion":
+                    # headless -p 跳不出真選單,但 tool_use 的 input 帶著結構化題目+選項;
+                    # 收下來讓面板渲染成可點按鈕(點了=送調整指示),取最後一次提問為準。
+                    qs = ti.get("questions")
+                    if isinstance(qs, list) and qs:
+                        asked[:] = qs
+
+    res = run_stream(cmd, cwd, prompt, on_event=on_event,
+                     timeout=ROUND_TIMEOUT, hard_timeout=HARD_CAP)
+    if not res.get("started"):
+        return {"ok": False, "error": res["error"]}
+    if res["killed"]:
+        # 區分「閒置卡死」與「總時長爆表」,讓看板訊息說得清楚(非籠統逾時)
+        if res.get("kill_reason") == "hard":
+            err = f"回合超過總時長上限({HARD_CAP}s,仍未收尾)"
+        else:
+            err = f"回合閒置逾時({ROUND_TIMEOUT}s 毫無進度,判定卡死)"
+        return {"ok": False, "error": err,
+                "files": sorted(changed), "hunks": hunks, "cmds": cmds}
+    if res["got_result"]:
+        return {"ok": True, "text": res["text"], "session_id": res["session_id"],
+                "cost": res["cost"], "files": sorted(changed), "hunks": hunks,
+                "cmds": cmds, "questions": list(asked)}
 
     # 沒拿到 result → 失敗。判斷是否為可重試的啟動失敗
-    code = (proc.returncode or 0) & 0xFFFFFFFF
-    if code in _STARTUP_FAIL_CODES and not text and sid is None:
+    code = (res["returncode"] or 0) & 0xFFFFFFFF
+    if code in _STARTUP_FAIL_CODES and not res["text"] and res["session_id"] is None:
         return {"ok": False, "startup_fail": True, "code": code, "error": (
             f"claude 無法啟動(0x{code:08X} 程序初始化失敗)。這通常是 Windows "
             f"資源/環境暫時性問題(殘留程序過多、桌面堆積吃緊)。"
             f"建議關掉多餘視窗或重開機後再派遣。")}
-    err = ""
-    if proc.stderr:
-        err = (proc.stderr.read() or "").strip()[:400]
-    return {"ok": False, "error": err or f"claude 結束碼 {proc.returncode}"}
+    err = res["stderr"]()[:400]
+    return {"ok": False, "error": err or f"claude 結束碼 {res['returncode']}"}
 
 
 def _build_cmd(resume_sid: str | None, model: str | None = None,
@@ -533,6 +575,9 @@ def _build_coding_card(text: str, headline_fallback: str,
     card = {
         "kind": "coding",
         "headline": (str(meta.get("headline") or headline_fallback or "")[:120]),
+        # 解決了哪一類問題(bugfix/feature/…)+ 一句話說明 —— 讓完成項目可被歸類、看懂
+        "category": _norm_category(meta.get("category")),
+        "solved": str(meta.get("solved") or "")[:200],
         "files": files,
         # 卡片層級總量(檔數 + 總 +/-);前端沒讀到時可自行由 files 加總,兩邊都相容
         "adds": total_adds,
@@ -545,8 +590,14 @@ def _build_coding_card(text: str, headline_fallback: str,
 # ── 職業 → 結果皮膚(呈現方式)──────────────────────────────
 # 委託指定的 klass 決定回來的結果卡種類;未指定則有改檔就 coding、否則 markdown。
 def _skin_for(klass: str | None, has_hunks: bool) -> str | None:
-    if klass in ("工程師", "機關師"):
+    if klass == "工程師":
         return "coding"
+    if klass == "機關師":
+        return "ops"  # 機關師顧基礎設施/服務:成果用「指令/服務」呈現,不是 code diff
+    if klass == "鑑定師":
+        return "review"  # 鑑定師查驗:成果是「查驗清單 + 裁決」,不是 diff
+    if klass == "斥候":
+        return "ship"  # 斥候出貨:成果是「送出的 commit / 推送 / 部署」,不是 diff
     if klass == "書記官":
         return "teaching"
     if not klass:
@@ -554,11 +605,64 @@ def _skin_for(klass: str | None, has_hunks: bool) -> str | None:
     return None  # 其他職業尚無專屬皮膚 → markdown 保底
 
 
+# coding 卡的「解決問題分類」slug —— 與前端 labels.js 的 PROBLEM_KINDS key 單一對應。
+# 讓每張完成卡標出「到底解決哪一類問題」,已完成項目才能被歸類、一眼看懂。
+_CODING_CATEGORIES = {
+    "bugfix", "feature", "refactor", "perf",
+    "config", "docs", "test", "ui", "chore", "other",
+}
+# 容忍模型回中文標籤 / 近義詞 → 正規化成上面的 slug
+_CATEGORY_ALIASES = {
+    "bug": "bugfix", "fix": "bugfix", "修bug": "bugfix", "修 bug": "bugfix",
+    "除錯": "bugfix", "修復": "bugfix",
+    "新功能": "feature", "功能": "feature", "feat": "feature",
+    "重構": "refactor",
+    "效能": "perf", "performance": "perf", "優化": "perf",
+    "設定": "config", "環境": "config", "設定/環境": "config", "infra": "config",
+    "文件": "docs", "doc": "docs", "文檔": "docs",
+    "測試": "test", "tests": "test",
+    "介面": "ui", "ui/ux": "ui", "樣式": "ui", "frontend": "ui",
+    "雜務": "chore", "雜項": "chore",
+}
+
+
+def _norm_category(raw) -> str:
+    """把模型回的分類字串正規化成已知 slug。認不得 → 'other'(永遠給得出一類)。"""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return "other"
+    if s in _CODING_CATEGORIES:
+        return s
+    return _CATEGORY_ALIASES.get(s, "other")
+
+
 # 各皮膚要冒險者在 DONE 回報附上的 CARD 契約(注入首回合 prompt)
 _CARD_CONTRACT = {
     "coding": '  `CARD: <單行 JSON,渲染成 coding 卡。格式:'
-              '{"headline":"一句話做了什麼","why":{"檔案路徑":"這個檔為什麼改"},"notes":"可選"};'
+              '{"headline":"一句話做了什麼","category":"<問題類型,擇一:bugfix 修Bug/'
+              'feature 新功能/refactor 重構/perf 效能/config 設定環境/docs 文件/test 測試/'
+              'ui 介面/chore 雜務/other 其他>","solved":"一句話:到底解決了哪個問題",'
+              '"why":{"檔案路徑":"這個檔為什麼改"},"notes":"可選"};'
               '純分析無改檔則寫 無>`',
+    "ops": '  `CARD: <單行 JSON,渲染成機關師卡(顯示跑了哪些指令、動了哪些服務/設定,'
+           '不是程式碼 diff)。格式:{"headline":"一句話做了什麼",'
+           '"category":"<問題類型,擇一:bugfix 修Bug/feature 新功能/refactor 重構/perf 效能/'
+           'config 設定環境/docs 文件/test 測試/ui 介面/chore 雜務/other 其他>",'
+           '"solved":"一句話:到底解決了哪個問題","services":["動到的服務/容器/主機,可選"],'
+           '"why":{"設定檔路徑":"這個檔為什麼改"},"notes":"可選"};純查看無動作則寫 無>`',
+    "review": '  `CARD: <單行 JSON,渲染成鑑定師查驗卡(顯示查了哪些項目、通過與否、總裁決,'
+              '不是程式碼 diff)。格式:{"headline":"一句話查了什麼",'
+              '"category":"<問題類型,擇一:bugfix 修Bug/feature 新功能/refactor 重構/perf 效能/'
+              'config 設定環境/docs 文件/test 測試/ui 介面/chore 雜務/other 其他>",'
+              '"verdict":"<總裁決,擇一:pass 通過/warn 有疑慮/fail 未過>",'
+              '"checks":[{"item":"查驗項目","ok":true,"note":"說明,可選"}],'
+              '"solved":"一句話結論","notes":"可選"};純瀏覽無查驗則寫 無>`',
+    "ship": '  `CARD: <單行 JSON,渲染成斥候出貨卡(顯示送出的 commit / 推送 / 部署去哪,'
+            '不是程式碼 diff)。格式:{"headline":"一句話出了什麼貨",'
+            '"category":"<問題類型,擇一:bugfix 修Bug/feature 新功能/refactor 重構/perf 效能/'
+            'config 設定環境/docs 文件/test 測試/ui 介面/chore 雜務/other 其他>",'
+            '"target":"推去哪,如 origin/main(可選)","commits":["commit 訊息"],'
+            '"solved":"一句話:交付了什麼","notes":"可選"};純查看無出貨則寫 無>`',
     "teaching": '  `CARD: <單行 JSON,渲染成教學字卡。格式:'
                 '{"kind":"teaching","headline":"這次教了什麼",'
                 '"cards":[{"front":"問題/概念","back":"白話解答"}]};'
@@ -678,13 +782,131 @@ def _build_teaching_card(text: str, headline_fallback: str) -> str | None:
     }, ensure_ascii=False)
 
 
+def _build_ops_card(text: str, headline_fallback: str,
+                    cmds: list[dict], hunks: dict[str, list[dict]]) -> str | None:
+    """組機關師 ops 結果卡:客觀收集的指令 + 動到的設定檔 + LLM 的 headline/solved/services。
+
+    機關師沒跑任何指令也沒改設定檔(純查看)→ 回 None,前端退回 markdown。
+    """
+    if not cmds and not hunks:
+        return None
+    meta = _parse_card(text)
+    steps = [{"cmd": c.get("cmd", ""), "desc": c.get("desc", "")} for c in cmds[:_MAX_CMDS]]
+    why = meta.get("why") if isinstance(meta.get("why"), dict) else {}
+    files = []
+    for path, hs in list((hunks or {}).items())[:20]:
+        w = why.get(path) or why.get(path.split("/")[-1]) or ""
+        adds, dels = _hunks_stat(hs)
+        files.append({"path": path, "why": str(w)[:200], "adds": adds, "dels": dels})
+    svc = meta.get("services")
+    services = ([str(s).strip()[:40] for s in svc if isinstance(s, str) and s.strip()][:12]
+                if isinstance(svc, list) else [])
+    card = {
+        "kind": "ops",
+        "headline": str(meta.get("headline") or headline_fallback or "")[:120],
+        "category": _norm_category(meta.get("category")),
+        "solved": str(meta.get("solved") or "")[:200],
+        "steps": steps,
+        "services": services,
+        "files": files,
+        "notes": str(meta.get("notes") or "")[:400],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+# 鑑定師查驗裁決 slug(與前端 labels.js 的 VERDICT_META key 一致);認不得 → 保守的 warn
+_VERDICT_WORDS = {
+    "pass": "pass", "ok": "pass", "passed": "pass", "通過": "pass", "達標": "pass",
+    "fail": "fail", "failed": "fail", "未過": "fail", "不通過": "fail", "不達標": "fail",
+    "warn": "warn", "warning": "warn", "有疑慮": "warn", "部分": "warn",
+}
+
+
+def _norm_verdict(raw) -> str:
+    return _VERDICT_WORDS.get(str(raw or "").strip().lower(), "warn")
+
+
+def _build_review_card(text: str, headline_fallback: str,
+                       cmds: list[dict]) -> str | None:
+    """組鑑定師查驗卡:LLM 的查驗清單 + 總裁決 + 客觀收集的查驗指令。
+
+    沒有任何查驗項目、也沒跑任何指令(純瀏覽)→ 回 None,前端退回 markdown。
+    """
+    meta = _parse_card(text)
+    checks = []
+    raw_checks = meta.get("checks")
+    if isinstance(raw_checks, list):
+        for c in raw_checks[:20]:
+            if isinstance(c, dict) and c.get("item"):
+                checks.append({
+                    "item": str(c.get("item"))[:160],
+                    "ok": bool(c.get("ok", c.get("pass", False))),
+                    "note": str(c.get("note") or "")[:160],
+                })
+    steps = [{"cmd": c.get("cmd", ""), "desc": c.get("desc", "")}
+             for c in (cmds or [])[:_MAX_CMDS]]
+    if not checks and not steps:
+        return None
+    card = {
+        "kind": "review",
+        "headline": str(meta.get("headline") or headline_fallback or "")[:120],
+        "category": _norm_category(meta.get("category")),
+        "solved": str(meta.get("solved") or "")[:200],
+        "verdict": _norm_verdict(meta.get("verdict")),
+        "checks": checks,
+        "steps": steps,
+        "notes": str(meta.get("notes") or "")[:400],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
+# 斥候出貨卡:從收集到的指令挑出「出貨型」動作(git / 部署 / 推送)
+_SHIP_CMD_RE = re.compile(
+    r"\b(git|gh|docker\s+push|docker\s+compose\s+push|npm\s+publish|"
+    r"deploy|rsync|scp|kubectl|helm|vercel|netlify)\b", re.IGNORECASE)
+
+
+def _build_ship_card(text: str, headline_fallback: str,
+                     cmds: list[dict]) -> str | None:
+    """組斥候出貨卡:LLM 回報的 commit / 目標 + 客觀收集的 git/部署指令。
+
+    沒有任何 commit、也沒跑任何出貨指令 → 回 None,前端退回 markdown。
+    """
+    meta = _parse_card(text)
+    raw_commits = meta.get("commits")
+    commits = ([str(c).strip()[:160] for c in raw_commits if isinstance(c, str) and c.strip()][:20]
+               if isinstance(raw_commits, list) else [])
+    ship_steps = [{"cmd": c.get("cmd", ""), "desc": c.get("desc", "")}
+                  for c in (cmds or []) if _SHIP_CMD_RE.search(c.get("cmd", ""))][:_MAX_CMDS]
+    if not commits and not ship_steps:
+        return None
+    card = {
+        "kind": "ship",
+        "headline": str(meta.get("headline") or headline_fallback or "")[:120],
+        "category": _norm_category(meta.get("category")),
+        "solved": str(meta.get("solved") or "")[:200],
+        "target": str(meta.get("target") or "")[:80],
+        "commits": commits,
+        "steps": ship_steps,
+        "notes": str(meta.get("notes") or "")[:400],
+    }
+    return json.dumps(card, ensure_ascii=False)
+
+
 def _build_card(row, text: str, headline: str,
-                hunks: dict[str, list[dict]] | None) -> str | None:
-    """依委託指定職業組對應的結果卡(coding / teaching);無則 None → markdown。"""
+                hunks: dict[str, list[dict]] | None,
+                cmds: list[dict] | None = None) -> str | None:
+    """依委託指定職業組對應的結果卡(coding / ops / review / ship / teaching);無則 None → markdown。"""
     klass = row["klass"] if "klass" in row.keys() else None
     skin = _skin_for(klass, bool(hunks))
     if skin == "coding":
         return _build_coding_card(text, headline, hunks or {})
+    if skin == "ops":
+        return _build_ops_card(text, headline, cmds or [], hunks or {})
+    if skin == "review":
+        return _build_review_card(text, headline, cmds or [])
+    if skin == "ship":
+        return _build_ship_card(text, headline, cmds or [])
     if skin == "teaching":
         return _build_teaching_card(text, headline)
     return None
@@ -693,7 +915,8 @@ def _build_card(row, text: str, headline: str,
 def _enqueue_report(row, text: str, last_msg: str,
                     files: list[str] | None = None,
                     outcome: str = "success",
-                    hunks: dict[str, list[dict]] | None = None) -> None:
+                    hunks: dict[str, list[dict]] | None = None,
+                    cmds: list[dict] | None = None) -> None:
     """DONE 時把結案回報送進櫃台佇列(→ wiki 歸檔 + 深度合成)。
 
     files:回合中「客觀」收集到的實際改動檔案(串流看到的 Edit/Write);
@@ -703,17 +926,45 @@ def _enqueue_report(row, text: str, last_msg: str,
     m = _REPORT_RE.search(text)
     summary = (m.group(1).strip() if m else last_msg)[:2000]
     changed = files or _files_from_report(text)
-    card = _build_card(row, text, last_msg, hunks)
+    lessons = _parse_lessons(text)
+    card = _build_card(row, text, last_msg, hunks, cmds)
     db.enqueue(
         adventurer_id=row["session_id"],
         guild=row["guild"],
         title=f"[派遣] {row['title']}",
         summary=summary,
         files_changed=json.dumps(changed, ensure_ascii=False),
-        lessons=_parse_lessons(text),
+        lessons=lessons,
         outcome=outcome,
         card=card,
+        to_wiki=not _task_memory_on(row),
     )
+    # 任務記憶:成果/心得一律累積在委託自己身上,續派直接帶上(不必撈全域 wiki)
+    entry = [f"[{time.strftime('%Y-%m-%d')}] {'✅' if outcome == 'success' else '🟡'} {last_msg}",
+             f"成果:{summary[:600]}"]
+    if lessons:
+        entry.append(f"心得:{lessons[:400]}")
+    if changed:
+        entry.append("檔案:" + ", ".join(changed[:10]))
+    db.append_task_memory(row["id"], "\n".join(entry))
+
+
+def _task_memory_on(row) -> bool:
+    return "task_memory" in row.keys() and bool(row["task_memory"])
+
+
+def _task_memory_block(row) -> str:
+    """把委託自己的任務記憶注入首回合 prompt;記憶特化時也叫冒險者別去撈全域 wiki。"""
+    keys = row.keys()
+    mem = (row["memory"] if "memory" in keys else None) or ""
+    parts: list[str] = []
+    if mem.strip():
+        parts.append("\n## 🧠 本任務記憶(先前派遣累積的成果/心得,接著這些做,別重來)\n"
+                     f"{mem.strip()}\n")
+    if _task_memory_on(row):
+        parts.append("\n## 📌 記憶範圍\n本委託的記憶特化在任務內:"
+                     "**不要去讀寫全域 llm wiki**(如 D:\\myInfo),相關脈絡以上方任務記憶與目前資料夾為準。\n")
+    return "".join(parts)
 
 
 def _report_text(text: str, fallback: str) -> str:
@@ -729,6 +980,18 @@ def _blocked_detail(text: str) -> str:
     冒險者這回合的完整輸出(去頭尾空白、上限 4000 字),供面板完整呈現。
     """
     return (text or "").strip()[:4000]
+
+
+# 連接器 OAuth token 過期:headless 冒險者無法自己完成瀏覽器登入,只能回報受阻。
+# 這種卡點看起來像「一直斷線/反覆受阻」,其實是等使用者去 Settings → Connectors
+# 重新授權。偵測到就把受阻訊息標清楚(🔑),別讓它混進籠統的「受阻」害人誤判。
+_REAUTH_RE = re.compile(
+    r"requires?\s+re-?auth(?:oriz|enticat)ation|token expired|re-?authoriz",
+    re.IGNORECASE)
+
+
+def _needs_reauth(text: str) -> bool:
+    return bool(_REAUTH_RE.search(text or ""))
 
 
 def _acceptance_review(row, done_text: str, cwd: str | None) -> dict:
@@ -771,21 +1034,37 @@ def _acceptance_review(row, done_text: str, cwd: str | None) -> dict:
     return {"passed": passed, "reason": reason, "cost": cost, "errored": False}
 
 
+async def _run(cid: int, key: str) -> None:
+    """跑一張派遣(呼叫前已在 _running 占好位子);結束釋放位子並叫醒佇列補位。"""
+    try:
+        await _loop(cid)
+    except Exception:  # noqa: BLE001 — 單張失敗不可拖垮其他並行派遣
+        log.exception("委託 #%s 執行時例外", cid)
+        db.update_commission(cid, status="failed")
+        db.add_event(cid, "system", "❌ 派遣時發生未預期錯誤,已中止(其他派遣不受影響)")
+    finally:
+        _running.pop(cid, None)
+        if _changed is not None:
+            _changed.set()
+        if db.queued_ids():
+            ensure_worker()  # 立即派遣結束也要讓排隊的接手
+
+
 async def run_dispatch(cid: int) -> None:
     """單張立即派遣:背景 task 執行,狀態全寫進 DB / events,前端輪詢即可看到。"""
-    global _dispatch_running
-    async with _lock:
-        if _dispatch_running:
-            db.add_event(cid, "system", "已有派遣進行中,本次未啟動")
-            return
-        _dispatch_running = True
-        try:
-            await _loop(cid)
-        finally:
-            _dispatch_running = False
+    row = db.get_commission(cid)
+    if row is None:
+        return
+    reason = block_reason(row)
+    if reason:
+        db.add_event(cid, "system", f"{reason},本次未啟動")
+        return
+    key = _folder_key(row)
+    _running[cid] = key  # 同步占位(無 await 之間),不會 TOCTOU
+    await _run(cid, key)
 
 
-# ── 派遣佇列(排隊自動依序跑)──────────────────────────────
+# ── 派遣佇列(排隊自動跑,有空位就並行補上)──────────────────
 
 def queue_running() -> bool:
     return _worker_task is not None and not _worker_task.done()
@@ -800,23 +1079,30 @@ def ensure_worker() -> None:
 
 
 async def _drain_queue() -> None:
-    """依序把佇列中的委託跑完;佇列空了就結束(下次 enqueue 再起)。"""
+    """把佇列中的委託跑完:FIFO 掃描,有空位且資料夾沒被占的就開跑;
+    跑不了的(資料夾被占/滿位)留在佇列,等有派遣結束再補位。佇列與執行都清空才結束。"""
+    global _changed
+    _changed = asyncio.Event()  # 綁定當前事件迴圈(每次起 worker 重建)
+    tasks: set[asyncio.Task] = set()
     while True:
-        cid = db.next_queued()
-        if cid is None:
+        _changed.clear()
+        pending = [c for c in db.queued_ids() if c not in _running]
+        if not pending and not _running:
             return
-        async with _lock:
+        for cid in pending:
             row = db.get_commission(cid)
             # 排隊期間可能被使用者取消(狀態改回 open)或刪除 → 跳過
             if row is None or row["status"] != "queued":
                 continue
-            log.info("佇列:開始執行委託 #%s", cid)
-            try:
-                await _loop(cid)
-            except Exception:  # noqa: BLE001 — 單張失敗不可拖垮整個佇列
-                log.exception("佇列:委託 #%s 執行時例外", cid)
-                db.update_commission(cid, status="failed")
-                db.add_event(cid, "system", "❌ 派遣時發生未預期錯誤,已跳過(佇列繼續)")
+            if block_reason(row):
+                continue
+            key = _folder_key(row)
+            _running[cid] = key
+            log.info("佇列:開始執行委託 #%s(並行 %s/%s)", cid, len(_running), PARALLEL)
+            t = asyncio.create_task(_run(cid, key))
+            tasks.add(t)  # 持有參照防 GC
+            t.add_done_callback(tasks.discard)
+        await _changed.wait()
 
 
 async def _loop(cid: int) -> None:
@@ -824,6 +1110,12 @@ async def _loop(cid: int) -> None:
     if row is None:
         return
     cwd = row["cwd"] or None
+    # 自建任務資料夾:在專屬子資料夾執行,讓並行任務不共用同一資料夾互卡。
+    # 依 id 穩定命名,續派沿用;已是任務資料夾則不再往下巢狀。
+    if "self_folder" in row.keys() and row["self_folder"]:
+        cwd = _make_task_folder(row)
+        if cwd != row["cwd"]:
+            db.update_commission(cid, cwd=cwd)
     db.update_commission(cid, status="working", stop_requested=0)
     db.add_event(cid, "system",
                  f"🚀 派遣啟動(資料夾:{cwd or '預設'},"
@@ -833,6 +1125,7 @@ async def _loop(cid: int) -> None:
     reworks = 0  # 櫃台驗收退回重做的次數(上限 MAX_REWORK)
     changed_files: set[str] = set()  # 跨回合累積的實際改動檔案(客觀,供回報)
     changed_hunks: dict[str, list[dict]] = {}  # 跨回合累積的 before→after(coding 卡)
+    ran_cmds: list[dict] = []  # 跨回合累積跑過的指令(機關師 ops 卡)
     for rnd in range(1, MAX_ROUNDS + 1):
         row = db.get_commission(cid)
         if row is None or row["stop_requested"]:
@@ -854,7 +1147,8 @@ async def _loop(cid: int) -> None:
             prompt = FIRST_PROMPT.format(
                 title=row["title"], goal=goal,
                 note=row["note"] or "(無)", max_rounds=MAX_ROUNDS,
-                capabilities=_capability_block(row["guild"], sid) + _image_block(row),
+                capabilities=(_capability_block(row["guild"], sid) + _image_block(row)
+                              + _task_memory_block(row)),
                 card_contract=_card_contract(_klass),
                 style_directive=_style_directive(_klass))
             if steers:
@@ -878,6 +1172,9 @@ async def _loop(cid: int) -> None:
             for _h in _hs:
                 if len(_cur) < _MAX_HUNKS_PER_FILE:
                     _cur.append(_h)
+        for _c in (res.get("cmds") or []):
+            if len(ran_cmds) < _MAX_CMDS:
+                ran_cmds.append(_c)
 
         if not res["ok"]:
             # 環境問題(claude 起不來,如 0xC0000142 桌面堆耗盡)≠ 任務失敗:
@@ -922,7 +1219,7 @@ async def _loop(cid: int) -> None:
             row = db.get_commission(cid)
             # 櫃台驗收:實地查驗產出是否達標,未過自動退回重做(閉環)。
             # 教學/內容型任務沒有可「唯讀查驗」的檔案產出,跳過驗收以免誤判失敗。
-            if ACCEPTANCE and rnd < MAX_ROUNDS and _skin_for(_klass, True) != "teaching":
+            if ACCEPTANCE and _skin_for(_klass, True) != "teaching":
                 db.add_event(cid, "system", "🔍 櫃台驗收中(唯讀查驗產出)…", rnd)
                 verdict = await asyncio.to_thread(
                     _acceptance_review, row, res["text"], cwd)
@@ -930,7 +1227,8 @@ async def _loop(cid: int) -> None:
                     db.add_cost("dispatch", float(verdict["cost"]), commission_id=cid,
                                 adventurer_id=sid, guild=row["guild"],
                                 model=ACCEPT_MODEL, detail=f"驗收 R{rnd}")
-                if not verdict["passed"] and reworks < MAX_REWORK:
+                if not verdict["passed"] and reworks < MAX_REWORK and rnd < MAX_ROUNDS:
+                    # 還有回合可退回重做
                     reworks += 1
                     db.add_event(cid, "system",
                                  f"↩️ 驗收未過(第 {reworks}/{MAX_REWORK} 次退回):"
@@ -940,14 +1238,19 @@ async def _loop(cid: int) -> None:
                                  f"請針對這點修正後再回報 DONE。")
                     continue  # 帶著退回原因進下一回合
                 if not verdict["passed"]:
-                    # 已達自動重做上限仍未過 → 標 blocked 轉人工,回報記 partial
+                    # 已達自動重做上限仍未過,或最後一回合驗收未過 → 標 blocked 轉人工
                     _enqueue_report(row, res["text"], msg,
                                     files=sorted(changed_files), outcome="partial",
-                                    hunks=changed_hunks)
+                                    hunks=changed_hunks, cmds=ran_cmds)
                     db.update_commission(cid, status="blocked")
+                    reason = (
+                        f"最後回合({MAX_ROUNDS})驗收未過"
+                        if rnd == MAX_ROUNDS
+                        else f"已達自動重做上限({MAX_REWORK})"
+                    )
                     db.add_event(cid, "system",
-                                 f"⚠️ 驗收仍未過且已達自動重做上限({MAX_REWORK}),"
-                                 f"轉人工審核:{verdict['reason']}", rnd)
+                                 f"⚠️ 驗收仍未過({reason}),轉人工審核:{verdict['reason']}",
+                                 rnd)
                     return
                 if verdict.get("errored"):
                     db.add_event(cid, "system",
@@ -957,7 +1260,7 @@ async def _loop(cid: int) -> None:
                     db.add_event(cid, "system",
                                  f"✅ 驗收通過:{verdict['reason']}", rnd)
             _enqueue_report(row, res["text"], msg, files=sorted(changed_files),
-                            hunks=changed_hunks)
+                            hunks=changed_hunks, cmds=ran_cmds)
             db.update_commission(cid, status="done",
                                  done_at=db._now())  # noqa: SLF001 同模組層級使用
             db.add_event(cid, "system",
@@ -969,8 +1272,19 @@ async def _loop(cid: int) -> None:
             detail = _blocked_detail(res["text"])
             if detail:
                 db.add_event(cid, "question", detail, rnd)
-            db.add_event(cid, "system",
-                         f"🧱 冒險者受阻,等待你的「調整指示」後可再派遣", rnd)
+            # 冒險者有用 AskUserQuestion 問 → 存結構化選項,面板渲染成可點選單(同回合對齊)
+            asked = res.get("questions")
+            if asked:
+                db.add_event(cid, "options",
+                             json.dumps({"questions": asked}, ensure_ascii=False), rnd)
+            if _needs_reauth(res["text"]):
+                db.add_event(cid, "system",
+                             "🔑 需重新授權連接器:冒險者無法自己登入(token 過期)。"
+                             "請到 Claude 的 Settings → Connectors 重新授權後再派遣。",
+                             rnd)
+            else:
+                db.add_event(cid, "system",
+                             f"🧱 冒險者受阻,等待你的「調整指示」後可再派遣", rnd)
             return
 
     db.update_commission(cid, status="blocked")

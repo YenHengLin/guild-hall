@@ -51,6 +51,7 @@ def _row_to_record(row) -> ReportRecord:
         review=_col(row, "review") or "pending",
         review_note=_col(row, "review_note"),
         card=card,
+        to_wiki=_col(row, "to_wiki", 1) != 0,
     )
 
 
@@ -90,15 +91,6 @@ def list_reports(limit: int = 30) -> list[ReportRecord]:
     return [_row_to_record(r) for r in db.list_reports(limit)]
 
 
-@router.post("/reports/{report_id}/approve")
-def approve_report(report_id: int) -> dict:
-    """幕後審核:認可這份報告。"""
-    if db.get_report(report_id) is None:
-        raise HTTPException(status_code=404, detail="找不到這份報告")
-    db.set_review(report_id, "approved", None)
-    return {"ok": True, "review": "approved"}
-
-
 @router.post("/reports/{report_id}/reject")
 def reject_report(report_id: int, body: ReviewReject) -> dict:
     """幕後審核:退回報告 → 標記 rejected,並重新入列讓櫃台重寫一份改進版。
@@ -125,6 +117,7 @@ def reject_report(report_id: int, body: ReviewReject) -> dict:
         title=f"🔄 重寫:{orig_title}", summary=summary,
         files_changed=row["files_changed"] or "[]",
         lessons=row["lessons"], outcome=row["outcome"] or "success",
+        to_wiki=_col(row, "to_wiki", 1) != 0,
     )
     return {"ok": True, "review": "rejected", "rewrite_id": new_id}
 

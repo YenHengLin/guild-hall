@@ -20,11 +20,11 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import threading
 from datetime import datetime, timezone
 
 from . import db, scanner
+from .claude_run import run_stream
 from .models import MuseConfig
 from .stream_recall import _summarize_tool
 
@@ -182,105 +182,70 @@ def _pick_guild(cfg: MuseConfig) -> tuple[str, str] | None:
     return g.name, g.path
 
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _iter_json_candidates(text: str):
+    """依序產出可能的 JSON 片段:先 ```json/``` fenced 區塊,再每個 '[' 起點。"""
+    for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL):
+        yield m.group(1).strip()
+    for i, ch in enumerate(text):
+        if ch == "[":
+            yield text[i:]
+
+
 def _extract_ideas(text: str) -> list[dict]:
-    """從模型輸出撈第一個 JSON 陣列(容忍 ```json 包裹)。"""
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
-    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+    """從模型輸出撈第一個 JSON 陣列。
 
-
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """整棵砍掉程序樹。Windows 的 claude.CMD 會包一層,只 kill 外層會留孤兒 node,
-    必須用 taskkill /T 連子孫一起殺(見這功能修復前留下的殭屍事故)。"""
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True)
-        else:
-            proc.kill()
-    except Exception:  # noqa: BLE001
+    容忍:```json 包裹、以及陣列前夾帶含中括號的說明(如夜巡 body 裡的
+    `[連結](url)`、`[註]`)。做法用 raw_decode 對每個候選起點嘗試——它只吃到
+    合法 JSON 結尾即停、遇雜訊就報錯,故雜訊 '[' 會被跳過,不像貪婪 `\\[.*\\]`
+    那樣從第一個 '[' 吞到最後一個 ']' 導致整段解析失敗、靈感靜默歸零。"""
+    for candidate in _iter_json_candidates(text):
         try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+            data, _ = _JSON_DECODER.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)]
+    return []
 
 
 def _run_survey(prompt: str, cwd: str, model: str) -> dict:
     """唯讀巡視(Read/Glob/Grep),逐行讀 stream-json 即時更新進度。
 
-    回傳 {ok, text/error, cost}。阻塞,於執行緒呼叫。自管逾時看門狗:到點用
-    taskkill /T 砍整棵樹,避免只殺外層 shim 留下孤兒程序。
+    回傳 {ok, text/error, cost}。阻塞,於執行緒呼叫。Popen / 逐行解析 / 逾時樹殺看門狗
+    都在共用的 claude_run.run_stream;這裡只負責把每步動作更新到面板進度。
     """
     cmd = [
         CLAUDE, "-p", "--output-format", "stream-json", "--verbose",
         "--model", model, "--max-turns", MAX_TURNS,
         "--allowedTools", "Read,Glob,Grep", "--permission-mode", "plan",
     ]
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=cwd, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-        )
-        proc.stdin.write(prompt)  # type: ignore[union-attr]
-        proc.stdin.close()  # type: ignore[union-attr]
-    except OSError as exc:
-        return {"ok": False, "error": f"無法啟動 claude:{exc}"}
 
-    killed = {"v": False}
+    def on_event(d: dict) -> None:
+        if d.get("type") != "assistant":
+            return
+        for blk in (d.get("message") or {}).get("content") or []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                name = blk.get("name", "?")
+                icon = _STEP_ICON.get(name, "•")
+                summ = _summarize_tool(name, blk.get("input") or {})
+                _progress_step(f"{icon} {name}" + (f" · {summ}" if summ else ""))
+            elif isinstance(blk, dict) and blk.get("type") == "text":
+                snippet = (blk.get("text") or "").strip().splitlines()
+                if snippet:
+                    _progress_step(f"💭 {snippet[0][:80]}")
 
-    def _watchdog() -> None:
-        killed["v"] = True
-        _kill_tree(proc)
-
-    timer = threading.Timer(TIMEOUT, _watchdog)
-    timer.start()
-
-    text, cost = "", None
-    got_result = False
-    try:
-        for line in proc.stdout:  # type: ignore[union-attr]
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            t = d.get("type")
-            if t == "assistant":
-                for blk in (d.get("message") or {}).get("content") or []:
-                    if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                        name = blk.get("name", "?")
-                        icon = _STEP_ICON.get(name, "•")
-                        summ = _summarize_tool(name, blk.get("input") or {})
-                        _progress_step(f"{icon} {name}" + (f" · {summ}" if summ else ""))
-                    elif isinstance(blk, dict) and blk.get("type") == "text":
-                        snippet = (blk.get("text") or "").strip().splitlines()
-                        if snippet:
-                            _progress_step(f"💭 {snippet[0][:80]}")
-            elif t == "result":
-                got_result = True
-                text = (d.get("result") or d.get("text") or text).strip()
-                cost = d.get("total_cost_usd")
-    finally:
-        timer.cancel()
-        try:
-            proc.wait(timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
-
-    if killed["v"]:
+    res = run_stream(cmd, cwd, prompt, on_event=on_event, timeout=TIMEOUT)
+    if not res.get("started"):
+        return {"ok": False, "error": res["error"]}
+    if res["killed"]:
         return {"ok": False, "error": f"夜巡逾時({TIMEOUT}s),已終止程序"}
-    if not got_result:
-        err = (proc.stderr.read() if proc.stderr else "").strip()[:300]
-        return {"ok": False, "error": err or f"claude 結束碼 {proc.returncode}"}
-    return {"ok": True, "text": text, "cost": cost}
+    if not res["got_result"]:
+        err = res["stderr"]()[:300]
+        return {"ok": False, "error": err or f"claude 結束碼 {res['returncode']}"}
+    return {"ok": True, "text": res["text"], "cost": res["cost"]}
 
 
 # 白話欄位(headline/next_step/impact)DB 沒有對應欄位,故打包進 body 前綴的

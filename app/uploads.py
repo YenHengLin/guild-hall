@@ -20,8 +20,11 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 # data URL:data:image/png;base64,xxxx
 _DATA_URL_RE = re.compile(r"^data:image/(?P<ext>[a-zA-Z0-9.+-]+);base64,(?P<b64>.+)$",
                           re.DOTALL)
+# svg+xml 仍映射成 svg,但 svg 已不在白名單 —— 這樣會以「不支援的格式:svg」擋下,
+# 而非含糊的 svg+xml。SVG 可內嵌 <script>,經 StaticFiles 原樣掛出後直接開圖網址
+# 會在面板同源下執行指令碼(儲存型 XSS),故不接受;面板附圖幾乎都是截圖 PNG/JPG。
 _EXT_FIX = {"jpeg": "jpg", "svg+xml": "svg"}
-_ALLOWED = {"png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"}
+_ALLOWED = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 MAX_BYTES = 12 * 1024 * 1024  # 單張上限 12MB,擋住異常大的貼上
 
 

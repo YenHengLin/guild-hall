@@ -208,6 +208,8 @@ class ReportRecord(BaseModel):
     review_note: str | None = None
     # 職業結果卡:依冒險者職業渲染的結構化結果(如 coding 卡含檔案 diff)。None = 用 markdown 保底
     card: dict | None = None
+    # False = 記憶特化在任務內,未寫入 llm wiki
+    to_wiki: bool = True
 
 
 class ReviewReject(BaseModel):
@@ -266,6 +268,9 @@ class CommissionPost(BaseModel):
     model: str | None = None  # 冒險者位階(模型 id;空 = 跟隨 CLI 預設)
     klass: str | None = None  # 指定職業/呈現皮膚(決定結果卡:coding diff / 教學字卡)
     images: list[str] = []  # 附圖 URL(/uploads/...);派遣時注入路徑供冒險者讀圖
+    domain: str | None = None  # 領域公會(以「做的事」分類,如「金融公會」)
+    self_folder: bool = False  # 自建任務資料夾:派遣時在專屬子資料夾執行(避免並行互卡)
+    task_memory: bool = False  # 記憶特化:結案只存任務記憶,不寫入 llm wiki
 
 
 # open(招募中)/ queued(排隊等派遣)/ working(執行中)/ blocked(受阻等指示)/ failed / done
@@ -291,16 +296,30 @@ class Commission(BaseModel):
     klass: str | None = None  # 指定職業/呈現皮膚
     cost: float = 0.0  # 此委託累計花費(USD,跨多次派遣)
     images: list[str] = []  # 附圖 URL(/uploads/...)
+    domain: str | None = None  # 領域公會(以「做的事」分類)
+    self_folder: bool = False  # 是否自建任務資料夾執行
+    memory: str | None = None  # 任務記憶(此委託自己累積的成果/心得)
+    task_memory: bool = False  # 記憶只留在任務內(不寫 wiki)
 
 
 class CommissionPatch(BaseModel):
-    """中途調整委託:改目標 / 標題 / 備註 / 工作資料夾 / 位階。"""
+    """中途調整 / 整張重新編輯委託:標題 / 目標 / 備註 / 資料夾 / 位階 / 皮膚 / 附圖。
+
+    欄位預設 None = 未提供即不更動;``images`` 明確傳空陣列則清空附圖。
+    """
 
     goal: str | None = None
     title: str | None = None
     note: str | None = None
     cwd: str | None = None
     model: str | None = None
+    klass: str | None = None
+    images: list[str] | None = None
+    domain: str | None = None
+    self_folder: bool | None = None
+    task_memory: bool | None = None
+    memory: str | None = None  # 可手動修訂/清空任務記憶
+
 
 
 class DispatchReq(BaseModel):
@@ -320,7 +339,9 @@ class CommissionEvent(BaseModel):
     """委託進度時間線一則。"""
 
     id: int
-    type: Literal["steer", "progress", "system", "step"]
+    # question = BLOCKED 時冒險者的提問 / 說明正文(dispatch._loop 寫入)。缺它會讓
+    # 任何走過 BLOCKED 的委託在回傳事件時序列化失敗 → steer/輪詢整串 500。
+    type: Literal["steer", "progress", "system", "step", "question"]
     content: str
     round: int | None = None
     created_at: str | None = None

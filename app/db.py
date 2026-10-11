@@ -13,7 +13,9 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "guild.db"
 
-_lock = threading.Lock()
+# 用 RLock(可重入):init_db()/_migrate() 等會在持鎖狀態下呼叫 get_conn(),
+# 而 get_conn() 內初始化也要上同一把鎖 —— 可重入才不會自我死鎖。
+_lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
 
 SCHEMA = """
@@ -168,10 +170,16 @@ def _now() -> str:
 
 def get_conn() -> sqlite3.Connection:
     global _conn
+    # 初始化必須在 _lock 內:FastAPI 多執行緒跑路由時,兩條執行緒可同時通過
+    # 「_conn is None」判斷並各自 sqlite3.connect(),後者覆蓋前者 → 連線洩漏、
+    # WAL PRAGMA 也只設到被丟棄的那條。鎖內再判一次(double-checked)確保只建一次。
     if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL")
+        with _lock:
+            if _conn is None:
+                conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                _conn = conn
     return _conn
 
 
@@ -195,6 +203,9 @@ def _migrate() -> None:
         # 職業結果卡(JSON):讓結果依冒險者職業渲染成專屬介面(如 coding diff 卡)
         if "card" not in cols:
             c.execute("ALTER TABLE reports ADD COLUMN card TEXT")
+        # 記憶特化:0 = 只留任務記憶,不寫入 llm wiki(減少 wiki 雜訊)
+        if "to_wiki" not in cols:
+            c.execute("ALTER TABLE reports ADD COLUMN to_wiki INTEGER DEFAULT 1")
         # 派遣系統:替既有 commissions 表補欄位
         ccols = {r["name"] for r in c.execute("PRAGMA table_info(commissions)")}
         for col, ddl in [
@@ -212,6 +223,16 @@ def _migrate() -> None:
             ("images", "ALTER TABLE commissions ADD COLUMN images TEXT"),
             # 指定職業/呈現皮膚(決定派遣結果卡的種類:coding diff / 教學字卡)
             ("klass", "ALTER TABLE commissions ADD COLUMN klass TEXT"),
+            # 領域公會(以「做的事」分類,如「金融公會」;疊加在資料夾公會之上)
+            ("domain", "ALTER TABLE commissions ADD COLUMN domain TEXT"),
+            # 自建任務資料夾:派遣時在專屬子資料夾執行,避免並行任務共用資料夾互卡
+            ("self_folder",
+             "ALTER TABLE commissions ADD COLUMN self_folder INTEGER DEFAULT 0"),
+            # 任務記憶:此委託自己累積的成果/心得(續派注入,不必撈全域 wiki)
+            ("memory", "ALTER TABLE commissions ADD COLUMN memory TEXT"),
+            # 1 = 記憶特化在任務內,結案回報不寫入 llm wiki
+            ("task_memory",
+             "ALTER TABLE commissions ADD COLUMN task_memory INTEGER DEFAULT 0"),
         ]:
             if col not in ccols:
                 c.execute(ddl)
@@ -233,16 +254,17 @@ def enqueue(
     lessons: str | None,
     outcome: str,
     card: str | None = None,
+    to_wiki: bool = True,
 ) -> int:
     with _lock:
         c = get_conn()
         cur = c.execute(
             """INSERT INTO reports
                (adventurer_id, guild, title, summary, files_changed, lessons,
-                outcome, status, created_at, card)
-               VALUES (?,?,?,?,?,?,?, 'pending', ?, ?)""",
+                outcome, status, created_at, card, to_wiki)
+               VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?)""",
             (adventurer_id, guild, title, summary, files_changed, lessons,
-             outcome, _now(), card),
+             outcome, _now(), card, 1 if to_wiki else 0),
         )
         c.commit()
         return int(cur.lastrowid)
@@ -366,6 +388,18 @@ def list_commissions(include_done: bool = True) -> list[sqlite3.Row]:
         return c.execute(
             "SELECT * FROM commissions WHERE status='open' ORDER BY id DESC"
         ).fetchall()
+
+
+def list_domains() -> list[str]:
+    """既有「領域公會」名稱(distinct,非空),供前端 datalist 建議。"""
+    with _lock:
+        c = get_conn()
+        rows = c.execute(
+            "SELECT domain, COUNT(*) n FROM commissions "
+            "WHERE domain IS NOT NULL AND domain != '' "
+            "GROUP BY domain ORDER BY n DESC"
+        ).fetchall()
+        return [r["domain"] for r in rows]
 
 
 def set_commission_status(cid: int, status: str) -> None:
@@ -573,10 +607,47 @@ def reset_working_to_blocked() -> list[int]:
     return ids
 
 
+# 可被 update_commission 動態更新的 commissions 欄位白名單。
+# 欄位名會直接拼進 SQL 字串,必須擋掉名單外的 key 以杜絕 SQL 注入
+# (呼叫端如 routers/commissions.py、muse.py 的 key 可能源自 HTTP 請求)。
+# 內容對應 commissions 表的全部非主鍵欄位(見本檔 SCHEMA 與 migration)。
+_COMMISSION_COLS = {
+    "guild", "title", "note", "status", "created_at", "done_at", "klass",
+    "goal", "cwd", "session_id", "rounds", "stop_requested", "model",
+    "cost", "images", "domain", "self_folder", "memory", "task_memory",
+}
+
+# 任務記憶上限:只留最近這麼多字(舊的從頭截掉),避免續派 prompt 被灌爆
+_TASK_MEMORY_MAX = 4000
+
+
+def append_task_memory(cid: int, entry: str) -> None:
+    """把一段成果/心得追加進委託自己的任務記憶(超過上限丟最舊的)。"""
+    entry = (entry or "").strip()
+    if not entry:
+        return
+    with _lock:
+        c = get_conn()
+        row = c.execute("SELECT memory FROM commissions WHERE id=?", (cid,)).fetchone()
+        if row is None:
+            return
+        mem = ((row["memory"] or "") + "\n\n" + entry).strip()
+        if len(mem) > _TASK_MEMORY_MAX:
+            mem = "…" + mem[-_TASK_MEMORY_MAX:]
+        c.execute("UPDATE commissions SET memory=? WHERE id=?", (mem, cid))
+        c.commit()
+
+
 def update_commission(cid: int, **fields) -> None:
-    """更新委託任意欄位(goal / status / session_id / rounds / stop_requested…)。"""
+    """更新委託任意欄位(goal / status / session_id / rounds / stop_requested…)。
+
+    只接受 ``_COMMISSION_COLS`` 白名單內的欄位名;其餘一律拋 ``ValueError``。
+    """
     if not fields:
         return
+    bad = set(fields) - _COMMISSION_COLS
+    if bad:
+        raise ValueError(f"update_commission: 不允許的欄位名 {sorted(bad)}")
     cols = ", ".join(f"{k}=?" for k in fields)
     with _lock:
         c = get_conn()

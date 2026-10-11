@@ -15,7 +15,7 @@ const props = defineProps({
 const store = useGuildStore()
 
 // 職業結果卡(如 coding 卡):有就用職業皮膚渲染,取代純檔名清單
-const KNOWN_CARDS = ['coding', 'teaching']
+const KNOWN_CARDS = ['coding', 'ops', 'review', 'ship', 'teaching']
 const hasCard = computed(() =>
   props.report.card && KNOWN_CARDS.includes(props.report.card.kind))
 // 教學卡是自足學習介面:不套櫃檯報告框,也提供「延伸深入」一鍵派工
@@ -37,7 +37,6 @@ const OUTCOME_META = {
   failed: { emoji: '❌', label: '未達成' },
 }
 const REVIEW_META = {
-  approved: { emoji: '✅', label: '已認可' },
   rejected: { emoji: '↩️', label: '已退回櫃台' },
 }
 const STATUS_TXT = {
@@ -46,10 +45,6 @@ const STATUS_TXT = {
 
 // ── 幕後審核 ──
 const busy = ref(false)
-async function approve() {
-  busy.value = true
-  try { await store.reviewApprove(props.report.id) } finally { busy.value = false }
-}
 async function reject() {
   const note = window.prompt('退回這份報告給櫃台重寫。\n可填退回原因(哪裡不清楚),留空也可以:', '')
   if (note === null) return
@@ -116,12 +111,9 @@ function cont() {
       <b>🧝‍♀️ 櫃台審查</b><Markdown :text="report.result" />
     </div>
 
-    <!-- 幕後審核:認可 / 退回櫃台重寫 / 派冒險者接續 -->
+    <!-- 幕後審核:退回櫃台重寫 / 派冒險者接續(認可對 AI 無作用,已移除)-->
     <div v-if="judge" class="crep__judge">
       <div class="crep__judge-btns">
-        <button class="jbtn jbtn--ok" :disabled="busy" @click="approve">
-          {{ report.review === 'approved' ? '✅ 已認可' : '✅ 認可' }}
-        </button>
         <button class="jbtn jbtn--redo" :disabled="busy" @click="reject">
           ✍️ 退回櫃台重寫
         </button>
