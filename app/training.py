@@ -4,7 +4,7 @@
 1. **分析是唯讀的**:headless Claude 只給 Read/Glob/Grep,看得到既有 skills 與
    memory(避免重複造輪子),但**不能寫任何檔**;產出是一份 JSON 提案。
 2. **落地要批准**:提案存進 evolution_proposals,面板上批准後才由後端把
-   artifact 寫到白名單路徑(~/.claude、D:\\projects、D:\\myInfo),並登記進化。
+   artifact 寫到白名單路徑(~/.claude、projects_dir、wiki 根目錄,見 config.yaml),並登記進化。
 3. 兩種模式:
    - `propose(adventurer_id)`:單一冒險者,依其解決過的任務擇一路線(訓練所 skill 的四路線)。
    - `distill()`:全公會提煉 —— 掃全部已完成回報的心得,依 llm-wiki-manager 的
@@ -15,29 +15,34 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from . import db
+from . import config, db
 
 log = logging.getLogger("guild.training")
 
 CLAUDE = shutil.which("claude") or "claude"
-MODEL = os.environ.get("GUILD_TRAIN_MODEL", "claude-sonnet-4-6")
-TIMEOUT = int(os.environ.get("GUILD_TRAIN_TIMEOUT", "300"))
+MODEL = config.get("GUILD_TRAIN_MODEL", "claude-sonnet-4-6")
+TIMEOUT = int(config.get("GUILD_TRAIN_TIMEOUT", "300"))
 MAX_TURNS = "12"
 
 SKILLS_DIR = Path.home() / ".claude" / "skills"
-MEMORY_DIR = Path.home() / ".claude" / "projects" / "D--" / "memory"
-# 批准後允許寫入的根目錄(路徑白名單)
+# memory 路線的落地目錄(預設 ~/.claude/memory;通常設成某個專案的 Claude 記憶目錄)
+MEMORY_DIR = Path(config.get("GUILD_MEMORY_DIR", str(Path.home() / ".claude" / "memory")))
+# script 路線的落地根目錄:<projects_dir>/<公會>/scripts/
+PROJECTS_DIR = Path(config.get("GUILD_PROJECTS_DIR", str(Path.home() / "projects")))
+_WIKI = config.get("GUILD_WIKI_DIR", "").strip()
+# 批准後允許寫入的根目錄(路徑白名單):~/.claude、專案根、wiki 所在根,加上自訂額外根目錄
 ALLOWED_ROOTS = [
     Path.home() / ".claude",
-    Path(r"D:\projects"),
-    Path(r"D:\myInfo"),
+    MEMORY_DIR,
+    PROJECTS_DIR,
+    *([Path(_WIKI).parent] if _WIKI else []),
+    *(Path(p) for p in config.get_list("GUILD_EXTRA_WRITE_ROOTS")),
 ]
 
 PROPOSE_PROMPT = """你是冒險者公會的訓練所教官。一位冒險者累積了足夠戰功,請依他「實際解決過的問題」\
@@ -157,7 +162,7 @@ def _default_artifact_path(route: str, name: str, guild: str | None) -> str:
     if route == "memory":
         return str(MEMORY_DIR / f"evolved_{safe}.md")
     if route == "script":
-        return str(Path(r"D:\projects") / (guild or "guild-hall") / "scripts" / safe)
+        return str(PROJECTS_DIR / (guild or "guild-hall") / "scripts" / safe)
     return ""
 
 

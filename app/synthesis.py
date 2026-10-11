@@ -2,7 +2,7 @@
 
 結構化存檔(reception.py)只是保底的記帳;真正符合大腦哲學的是「持續合成」:
 每筆回報都應該去更新對應的主題頁、補 index.md 連結,而不是堆流水帳。
-這一步交給 headless Claude(llm-wiki-manager 準則)在 D:\\myInfo 內執行。
+這一步交給 headless Claude(llm-wiki-manager 準則)在 wiki 目錄(config 的 wiki_dir)內執行。
 
 護欄:
 - 合成失敗不影響回報歸檔(存檔先完成,合成是加值)。
@@ -15,19 +15,18 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from . import db
+from . import config, db
 
 log = logging.getLogger("guild.synthesis")
 
-ENABLED = os.environ.get("GUILD_SYNTHESIS", "1") == "1"
-MODEL = os.environ.get("GUILD_SYNTH_MODEL", "claude-haiku-4-5-20251001")
-TIMEOUT = int(os.environ.get("GUILD_SYNTH_TIMEOUT", "300"))  # 秒
+ENABLED = config.get("GUILD_SYNTHESIS", "1") == "1"
+MODEL = config.get("GUILD_SYNTH_MODEL", "claude-haiku-4-5-20251001")
+TIMEOUT = int(config.get("GUILD_SYNTH_TIMEOUT", "300"))  # 秒
 MAX_TURNS = "15"
 CLAUDE = shutil.which("claude") or "claude"
 

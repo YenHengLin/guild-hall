@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 
+from . import config
+
 log = logging.getLogger("guild.polish")
 
 CLAUDE = shutil.which("claude") or "claude"
-MODEL = os.environ.get("GUILD_POLISH_MODEL", "claude-haiku-4-5-20251001")
-TIMEOUT = int(os.environ.get("GUILD_POLISH_TIMEOUT", "120"))  # 秒
+MODEL = config.get("GUILD_POLISH_MODEL", "claude-haiku-4-5-20251001")
+TIMEOUT = int(config.get("GUILD_POLISH_TIMEOUT", "120"))  # 秒
 
 PROMPT = """你是公會櫃台的文書助手。使用者寫了一份草稿結案回報,可能潦草、條列不整,\
 也可能夾帶對冒險者(AI)產出的批評(例如「code 細節寫太少」「錯誤處理沒寫」)。\

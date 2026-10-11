@@ -1,0 +1,56 @@
+# Guild Hall 設定範本 —— 複製成 config.yaml 再改(config.yaml 不進 git,每台機器各一份)
+#   cp config.example.yaml config.yaml
+#
+# 優先序:環境變數 > config.yaml > 程式內預設值
+# 每個 key 都對應一個環境變數:GUILD_ + 大寫,例如 wiki_dir ↔ GUILD_WIKI_DIR
+# 沒寫的 key 就用預設值;整份檔案不存在也能跑。
+
+# ── 路徑 ─────────────────────────────────────────────
+# llm wiki 目錄。結案回報會歸檔到 <wiki_dir>/公會回報/,並由 AI 合成進主題頁。
+# 留空 = 不寫 wiki(回報只存在公會 DB,櫃台側邊欄仍可搜尋)
+wiki_dir: ""
+# 「自建任務資料夾」的基底;留空 = 委託指定的資料夾底下(_tasks/<領域>/<標題-id>/)
+task_base: ""
+# 訓練所 script 路線落地到 <projects_dir>/<公會>/scripts/
+projects_dir: "~/projects"
+# 訓練所 memory 路線落地目錄(可設成某個專案的 Claude 記憶目錄)
+memory_dir: "~/.claude/memory"
+# 訓練所批准落地時額外允許寫入的根目錄(~/.claude、projects_dir、wiki 上層已預設允許)
+extra_write_roots: []
+
+# ── 派遣 ─────────────────────────────────────────────
+dispatch_parallel: 2          # 同時最多幾張派遣(同資料夾永遠只跑一張);太多會耗盡 Windows 桌面堆
+dispatch_model: ""            # 預設派遣模型;空 = claude CLI 預設
+dispatch_rounds: 6            # 每張委託最多幾回合
+dispatch_timeout: 600         # 單回合「毫無輸出」多久算卡死(秒)
+dispatch_hard_cap: 2400       # 單回合總時長上限(秒)
+dispatch_turns: 25            # claude 每回合內部 max-turns
+dispatch_tools: "Read,Glob,Grep,Edit,Write,Bash,WebSearch,WebFetch"
+dispatch_startup_retries: 3   # claude 起不來(0xC0000142 等)時重試次數
+
+# ── 櫃台驗收(DONE 時另起唯讀 claude 查驗)──────────────
+acceptance: true
+accept_model: "claude-sonnet-4-6"
+acceptance_rework: 1          # 驗收沒過最多自動退回幾次
+accept_timeout: 300
+
+# ── 回報合成 / 其他 AI 小工 ────────────────────────────
+synthesis: true               # 回報寫 wiki 後是否跑 AI 合成
+synth_model: "claude-haiku-4-5-20251001"
+synth_timeout: 300
+git_commit: false             # 寫完 wiki 是否自動 git commit
+polish_model: "claude-haiku-4-5-20251001"
+polish_timeout: 120
+classify_model: "claude-haiku-4-5-20251001"
+classify_timeout: 120
+train_model: "claude-sonnet-4-6"
+train_timeout: 300
+muse_timeout: 240
+muse_turns: 14
+stream_recall_timeout: 180
+
+# ── 雜項 ─────────────────────────────────────────────
+cache_max: 512
+activity_max_bytes: 5242880
+activity_keep_days: 7
+# 注意:即時動態 log 路徑(GUILD_ACTIVITY_LOG)只吃環境變數,因為 hook 腳本也要讀同一個值

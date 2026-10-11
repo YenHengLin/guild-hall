@@ -5,3 +5,7 @@ web/dist/
 .pytest_cache/
 *.stackdump
 uploads/
+
+config.yaml
+start.local.bat
+build_split_sheet.py

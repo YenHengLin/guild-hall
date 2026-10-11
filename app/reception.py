@@ -10,21 +10,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import subprocess
 from datetime import date
 from pathlib import Path
 
-from . import db, synthesis
+from . import config, db, synthesis
 
 log = logging.getLogger("guild.reception")
 
-WIKI_DIR = Path(os.environ.get("GUILD_WIKI_DIR", r"D:\myInfo\wiki"))
-ARCHIVE_DIR = WIKI_DIR / "公會回報"
-LOG_FILE = WIKI_DIR / "log.md"
-# 預設不自動 git commit(D:\ 是個龐大的 repo,避免意外提交)。設 1 才開。
-GIT_COMMIT = os.environ.get("GUILD_GIT_COMMIT", "0") == "1"
+# llm wiki 目錄;留空 = 不寫 wiki(回報只存在公會 DB,櫃台側邊欄仍可搜尋)
+_WIKI = config.get("GUILD_WIKI_DIR", "").strip()
+WIKI_DIR = Path(_WIKI) if _WIKI else None
+ARCHIVE_DIR = WIKI_DIR / "公會回報" if WIKI_DIR else None
+LOG_FILE = WIKI_DIR / "log.md" if WIKI_DIR else None
+# 預設不自動 git commit(wiki 可能在龐大的 repo 裡,避免意外提交)。設 1 才開。
+GIT_COMMIT = config.get("GUILD_GIT_COMMIT", "0") == "1"
 
 _INVALID = re.compile(r'[<>:"/\\|?*]')
 
@@ -143,6 +144,8 @@ def process_report(row) -> tuple[str, str]:
     # 記憶特化:成果已存進委託自己的任務記憶,不寫 llm wiki、不跑合成(wiki 不再被灌爆)
     if "to_wiki" in row.keys() and row["to_wiki"] == 0:
         return "done", "🧠 已存入任務記憶(未寫入 llm wiki)"
+    if WIKI_DIR is None:
+        return "done", "🗂 已存入公會紀錄(未設定 wiki_dir,不寫 wiki)"
     guild = row["guild"] or "未知公會"
     title = row["title"] or "無題回報"
     today = date.today().strftime("%Y-%m-%d")

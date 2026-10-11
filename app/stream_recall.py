@@ -23,6 +23,8 @@ from collections import deque
 from pathlib import Path
 from typing import Callable, Iterator
 
+from . import config
+
 log = logging.getLogger("guild.stream_recall")
 
 
@@ -82,7 +84,7 @@ CHEAP_MODEL = "claude-haiku-4-5-20251001"
 
 # 即時串流的閒置逾時(秒):連續這麼久毫無任何 stream 輸出就判定被召回的 claude
 # hang 住,taskkill 整棵程序樹。與 recall.TIMEOUT 對齊(非串流召回也是 180s)。
-IDLE_TIMEOUT = int(os.environ.get("GUILD_STREAM_RECALL_TIMEOUT", "180"))
+IDLE_TIMEOUT = int(config.get("GUILD_STREAM_RECALL_TIMEOUT", "180"))
 
 REPORT_PROMPT = (
     "【結案回報】你正被公會櫃台召回。請只『回顧』這個 session 從開始到現在"

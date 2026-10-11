@@ -18,6 +18,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import config
+
 log = logging.getLogger("guild.activity_log")
 
 LOG = Path(os.environ.get(
@@ -25,9 +27,9 @@ LOG = Path(os.environ.get(
 ARCHIVE_DIR = LOG.parent / "guild-activity.archive"
 
 # 主檔門檻:超過就輪替(改善計畫建議 5 MB)
-MAX_BYTES = int(os.environ.get("GUILD_ACTIVITY_MAX_BYTES", str(5 * 1024 * 1024)))
+MAX_BYTES = int(config.get("GUILD_ACTIVITY_MAX_BYTES", str(5 * 1024 * 1024)))
 # 主檔保留「最近 N 天」,更舊的搬去歸檔
-KEEP_DAYS = int(os.environ.get("GUILD_ACTIVITY_KEEP_DAYS", "7"))
+KEEP_DAYS = int(config.get("GUILD_ACTIVITY_KEEP_DAYS", "7"))
 
 
 def _month_of(line: str) -> str:

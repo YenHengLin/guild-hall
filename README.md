@@ -1,53 +1,155 @@
 # 冒險者公會大廳 (Guild Hall)
 
-把散落在各資料夾的 Claude Code session 包裝成 RPG 冒險者公會的**大廳場景**面板。
+把 Claude Code 包裝成一座 RPG **冒險者公會**:你在布告欄貼「委託」,公會派 headless Claude
+冒險者去執行;執行過程即時可見、可中途調整;完成後櫃台驗收、歸檔、整理成可讀的成果卡,
+並累積成任務記憶 / 知識庫。
 
-- **公會** = 一個資料夾(`~/.claude/projects/<dir>`),在地板上是一座站台
-- **冒險者** = 一個 session(`.jsonl`),是站台上的一個 CSS 小人
-- **狀態** = 依最後活動時間:⚔️ 冒險中(<10min,跳動)/ 🍺 休息中(<24h,搖擺)/ 💤 久未歸來(灰階)
-- **職業** = 依最擅長技能推派(術士/工程師/書記官…)
-- **等級 / XP** = token 用量換算,角色與公會皆有經驗條
+- **委託** = 一個你要完成的任務(標題、目標、附圖、指定資料夾、模型位階、呈現方式)
+- **冒險者** = 一個 Claude Code session(派遣產生,或掃描 `~/.claude/projects` 既有 session)
+- **公會** = 資料夾公會(session 所在專案)+ **領域公會**(以「做的事」分類,如「金融公會」)
+- **櫃台** = 收回報、驗收、歸檔、可搜尋的回報紀錄
 
-唯讀,不需要 hooks、不改任何 Claude 設定。
+> 需求:Windows / macOS / Linux、Python 3.10+、Node 18+、已登入的 [`claude` CLI](https://docs.claude.com/en/docs/claude-code)。
+> 主要在 Windows 上開發與使用(附 `start.bat` / `stop.bat`)。
 
-## 大廳場景
+---
 
-- **後牆布告欄** — 進行中的委託單(冒險中/休息中的 session),點擊直接開該冒險者細節
-- **右側櫃檯小姐** — 播報今日戰報摘要,點擊開完整戰報面板
-- **地板站台** — 每個公會一台,含公會等級 + 經驗條 + 旗下冒險者小人
+## 快速開始
 
-## 戰報面板(成長系統)
-
-點櫃檯小姐開啟,一眼看進度:
-
-- **今日 / 本週** 委託數、行動數、token 消耗、出勤公會
-- **今日最活躍公會** 排行榜
-- **活躍熱力圖** — GitHub 風格,近 12 週每天的行動量
-- **成就徽章** — 連續冒險、公會網絡、百萬委託、技能精通…(未解鎖顯示進度)
-
-## 啟動
-
-**後端**(port 8848):
-```
+```bash
+git clone https://github.com/YenHengLin/guild-hall.git
+cd guild-hall
 pip install -r requirements.txt
-python -m uvicorn app.main:app --port 8848 --reload
+cp config.example.yaml config.yaml   # 依需要修改(可省略,全用預設值)
 ```
 
-**前端**(port 5173,dev 已 proxy /api → 8848):
-```
-cd web
-npm install
-npm run dev
+**Windows**:雙擊 `start.bat`(首次會自動 `npm install`),會開兩個最小化視窗並打開瀏覽器;
+`stop.bat` 關閉。
+
+**手動啟動**:
+
+```bash
+# 後端(port 8848)
+python -m uvicorn app.main:app --port 8848
+
+# 前端(port 5173,dev 已 proxy /api、/uploads → 8848)
+cd web && npm install && npm run dev
 ```
 
-開 http://localhost:5173
+開 <http://localhost:5173>。
+
+> ⚠️ 後端**不要**加 `--reload`:派遣的冒險者常會改到本專案自己的 `.py`,`--reload`
+> 會把正在跑派遣的後端重啟(自己把自己踢掉)。改完後端程式碼請手動重啟。
+> 改了 DB schema 的版本更新後也需要重啟,啟動時會自動 migration。
+
+---
+
+## 設定(config.yaml)
+
+所有可調參數集中在 `config.yaml`(不進 git,每台機器各一份),範本與說明見
+[`config.example.yaml`](config.example.yaml)。
+
+- 優先序:**環境變數 > config.yaml > 程式預設值**
+- 每個 key 對應一個環境變數:`GUILD_` + 大寫,例如 `wiki_dir` ↔ `GUILD_WIKI_DIR`
+- 路徑可用 `~` 開頭;Windows 路徑請用**單引號**(`'D:\myInfo\wiki'`)
+- 換設定檔位置:環境變數 `GUILD_CONFIG=/path/to/config.yaml`
+
+常用設定:
+
+| key | 預設 | 說明 |
+|---|---|---|
+| `wiki_dir` | `""` | llm wiki 目錄;留空 = 不寫 wiki,回報只存在公會 DB |
+| `dispatch_parallel` | `2` | 同時最多幾張派遣(同資料夾永遠只跑一張) |
+| `dispatch_model` | `""` | 預設派遣模型;空 = CLI 預設 |
+| `task_base` | `""` | 自建任務資料夾的基底 |
+| `projects_dir` | `~/projects` | 訓練所 script 落地根目錄 |
+| `memory_dir` | `~/.claude/memory` | 訓練所 memory 落地目錄 |
+| `acceptance` | `true` | DONE 時是否跑櫃台驗收 |
+
+---
+
+## 功能
+
+### 📜 委託布告欄 + 派遣
+
+- 貼委託:標題 / 目標 / 備註、貼上或選取**附圖**、工作資料夾、**冒險者位階**(模型)、
+  **呈現方式**(決定結果卡皮膚)、🏷 **領域公會**、📁 **自建任務資料夾**、🧠 **任務記憶**。
+  草稿點視窗外不會消失;可整張重新編輯後再派遣。
+- **派遣 = 回合制**:每回合冒險者推進一段,回報 `STATUS: WORKING / DONE / BLOCKED`。
+  回合之間可 ✏️ 改目標、🗣 下中途指示、⏹ 停止;冒險者用 `AskUserQuestion` 提問時,
+  面板會渲染成可點選的按鈕。
+- **即時時間線**:每個工具動作(讀檔、改檔、跑指令…)即時顯示。任務可 ⤢ 彈出成
+  可拖曳、可拉寬的浮動視窗。
+- **排隊**:可一次排多張,背景 worker 有空位就自動開跑。
+- **並行派遣**:最多 `dispatch_parallel` 張同時跑;**同一資料夾同時只跑一張**
+  (避免互改檔案)。要讓同資料夾的任務並行,勾「📁 自建任務資料夾」——
+  冒險者會在 `<base>/_tasks/<領域>/<標題-id>/` 裡工作。
+- **櫃台驗收**:冒險者宣稱 DONE 時,另起唯讀 claude 實地查驗;沒過自動退回重做,
+  仍不過則轉人工。
+- 已完成的委託依 **今天 / 本週 / 更早** 分區,舊的預設收合。
+
+### 🧠 任務記憶(記憶特化)
+
+- 每張委託結案時,成果 / 心得 / 改動檔案自動累積到**這張委託自己的任務記憶**,
+  續派時注入首回合 prompt,冒險者接著做而不是重來。
+- 勾選「記憶特化在任務內」(預設勾選)時,回報**不寫入 llm wiki**、不跑合成,
+  並提示冒險者別去撈全域 wiki;回報仍可在櫃台搜尋。
+
+### 🎨 職業結果卡
+
+依冒險者職業 / 呈現方式,把結果渲染成專屬介面,而不是一大段文字:
+
+| 皮膚 | 內容 |
+|---|---|
+| coding | VS Code 式檔案清單,點檔案看 before → after diff |
+| teaching | 互動教學字卡(問答 + 3 選 1 小測驗 + 真實數據圖表) |
+| ops | 跑過的指令、動到的服務、設定檔異動 |
+| review | 查驗清單 + 裁決(pass / warn / fail) |
+| ship | commit、推送目標、部署指令 |
+
+### 🧝‍♀️ 櫃台側邊欄
+
+- 右側可收合;收合時布告欄滿版。展開後**就地顯示**,可拖左緣加寬。
+- **回報搜尋**(標題 / 公會 / 內容),點開看完整回報與結果卡。
+- 幕後審核:**✍️ 退回櫃台重寫**(你的說明會被學成敘事偏好)、
+  **🔧 派冒險者接續**(召回原 session 實際重做)。
+- 「📊 完整戰報」:今日 / 本週統計、熱力圖、成本帳本、成就、學習迴路。
+
+### 📚 回報歸檔 → wiki 深度合成(選用)
+
+設定了 `wiki_dir` 才會啟用。櫃台單一 worker 序列化處理:
+
+1. **存檔(保底)**:寫進 `<wiki_dir>/公會回報/<公會>.md`,並前插 `<wiki_dir>/log.md`
+2. **深度合成(加值)**:headless Claude 把回報綜合進對應主題頁並補 `index.md` 連結;
+   失敗不影響存檔
+
+相關設定:`synthesis`、`synth_model`、`synth_timeout`、`git_commit`。
+
+### 🎓 訓練所(提案制進化)
+
+- **單人訓練**:分析某位冒險者解決過的任務,產出一項進化提案(skill / memory / tool / script)
+- **⚗️ 全公會提煉**:從近期全部回報提取跨任務通則
+- **批准才落地**:只會寫進白名單路徑(`~/.claude`、`memory_dir`、`projects_dir`、
+  wiki 上層、`extra_write_roots`),既有檔案先備份 `.bak`
+
+### 🌙 公會夜巡
+
+NPC 依你的公會現況自主產生靈感,可升級成委託;標記為安全的可自動執行。
+
+### 🔮 召回冒險者
+
+用 session id 叫回原本的 Claude(`claude --resume`)問問題或接續工作——
+重開機後也能找回「哪個冒險者在哪個資料夾做到哪」。
+
+---
 
 ## 零 token 即時觀測(選配,需掛 hook)
 
-大廳頂端「📡 現在在做什麼」即時流,靠一個 **PostToolUse hook** 把每個工具呼叫寫成一行白話
-紀錄(`~/.claude/guild-activity.jsonl`),面板讀它顯示。**完全不經過模型 → 不花任何 token**。
+大廳頂端「📡 現在在做什麼」,靠一個 **PostToolUse hook** 把每個工具呼叫寫成一行白話紀錄
+(預設 `~/.claude/guild-activity.jsonl`,可用環境變數 `GUILD_ACTIVITY_LOG` 改)。
+完全不經過模型,不花 token。
 
-安裝:在 `~/.claude/settings.json`(全域,對所有資料夾生效)加入:
+在 `~/.claude/settings.json` 加入(路徑換成你的 clone 位置):
 
 ```json
 {
@@ -56,7 +158,7 @@ npm run dev
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "python \"D:\\projects\\guild-hall\\hooks\\activity_logger.py\"" }
+          { "type": "command", "command": "python \"<clone 路徑>/hooks/activity_logger.py\"" }
         ]
       }
     ]
@@ -64,64 +166,51 @@ npm run dev
 }
 ```
 
-(若已有其他 hooks,合併到同一個 `hooks` 物件下即可。)裝好後,任何資料夾的 Claude 每做一個
-動作,大廳就即時看得到,零 token。hook 腳本:`hooks/activity_logger.py`(必以 UTF-8 讀 stdin)。
+---
 
-## 櫃台回報 → 深度合成(A4+)
+## 專案結構
 
-冒險者回報(`POST /api/reports` 或 `公會報告` skill)入列後,櫃台單一 worker 兩段式處理:
+```
+app/                FastAPI 後端
+  config.py         設定載入(環境變數 > config.yaml > 預設)
+  dispatch.py       派遣系統(回合制、並行、驗收、結果卡、任務記憶)
+  reception.py      櫃台 worker(回報歸檔 → wiki)
+  synthesis.py      wiki 深度合成
+  training.py       訓練所
+  muse.py           公會夜巡
+  scanner.py        掃描 ~/.claude/projects 的 session
+  db.py             SQLite(guild.db,啟動時自動 migration)
+  routers/          API 路由
+web/                Vue 3 + Vite + Pinia 前端
+hooks/              Claude Code hook(即時動態)
+tests/              pytest
+config.example.yaml 設定範本
+start.bat / stop.bat Windows 啟動 / 關閉
+```
 
-1. **存檔(保底)** — 寫進 `wiki/公會回報/<公會>.md` + 前插 `wiki/log.md`,永遠成功。
-2. **深度合成(加值)** — spawn headless Claude(haiku、只給 Read/Glob/Grep/Edit/Write、
-   max-turns 15、逾時 300s),依 llm-wiki-manager 準則把回報綜合進對應 Wiki **主題頁**
-   並補 `index.md` 連結。失敗不影響存檔。
+本機專屬的啟動附加步驟(例如印出 Tailscale 位址)可放 `start.local.bat`(不進 git),
+`start.bat` 會自動呼叫。
 
-環境變數:`GUILD_SYNTHESIS=0` 關閉合成、`GUILD_SYNTH_MODEL` 換模型、
-`GUILD_SYNTH_TIMEOUT` 調逾時、`GUILD_GIT_COMMIT=1` 開啟 wiki git 提交。
+## 開發
 
-## 派遣系統(委託 → headless 冒險者執行)
+```bash
+python -m pytest tests/ -q     # 後端測試
+cd web && npm run build        # 前端建置檢查
+```
 
-布告欄的委託可以「🚀 派遣」給一位 headless Claude 冒險者,**回合制**執行:
+## API 一覽
 
-- 每回合冒險者實際動手推進,結束時回報 `STATUS: WORKING/DONE/BLOCKED`,面板顯示進度時間線
-- **回合之間**櫃台會注入你最新的目標(✏️ 調整)與中途指示(🗣 steer)→ **中途調整任務方向**
-- `DONE` 時自動把 `REPORT` 送進櫃台佇列(→ wiki 歸檔 + 深度合成),委託自動標記完成 → 閉環
-- `BLOCKED` / 回合用盡時暫停,下指示後可「再派遣」續同一位冒險者(同 session)
-- **冒險者位階**:每張委託可選派遣模型 —— 🥉銅牌(haiku,快省)/🥈銀牌(sonnet)/
-  🥇金牌(opus,最強);未選則跟隨 `GUILD_DISPATCH_MODEL` → CLI 預設
-- 護欄:一次一個派遣、回合上限(`GUILD_DISPATCH_ROUNDS`,預設 6)、單回合逾時
-  (`GUILD_DISPATCH_TIMEOUT`,預設 600s)、工具白名單(`GUILD_DISPATCH_TOOLS`)、
-  模型可換(`GUILD_DISPATCH_MODEL`)
+所有路由前綴 `/api`。
 
-## 訓練所(進化 / 提煉 skill,提案制)
-
-招牌上的「🎓 訓練所」面板,或冒險者抽屜的「送訓練所」:
-
-1. **單人訓練** — headless Claude(唯讀:Read/Glob/Grep)分析該冒險者解決過的任務,
-   從四路線(memory / skill / tool / script)擇一產出**進化提案**(含完整 artifact 內容)
-2. **⚗️ 全公會提煉** — 掃近期全部完成回報,依 llm-wiki-manager 的 Prune 準則
-   「去雜訊、提取通則」,把跨任務反覆出現的模式凝成一項能力提案
-3. **批准才落地** — 提案在面板審核;✅ 批准後後端才把 skill/memory/script 寫進
-   白名單路徑(`~/.claude`、`D:\projects`、`D:\myInfo`),既有檔案先備份 `.bak`,
-   memory 路線自動補 `MEMORY.md` 索引,並登記進化(🎓 習得能力)
-
-環境變數:`GUILD_TRAIN_MODEL`(預設 sonnet)、`GUILD_TRAIN_TIMEOUT`(預設 300s)。
-
-## API
-
-- `GET /api/guilds` — 所有公會 + 冒險者摘要(含 level / total_tokens)
-- `GET /api/adventurers/{sessionId}` — 單一冒險者細節 + 冒險日誌
-- `GET /api/report` — 戰報:今日/本週、熱力圖、成就、布告欄任務
-- `GET /api/activity` — 即時動態(讀 hook 寫的 guild-activity.jsonl,零 token 觀測)
-- `GET /api/recall/{report,ask,continue}` — 召回冒險者(用 session id 復活原 Claude)
-- `POST /api/commissions/{id}/dispatch|steer|stop` + `GET .../events` — 派遣系統
-- `PATCH /api/commissions/{id}` — 中途調整委託目標
-- `POST /api/training/propose|distill`、`GET /api/proposals`、
-  `POST /api/proposals/{id}/approve|reject` — 訓練所自動化
-- `GET /api/health`
-
-## 後續里程碑(未實作)
-
-- MVP3 櫃台小姐「驗收」:派遣完成後自動 review + 不合格退回重做
-- 派遣佇列:多張委託排隊自動依序派遣(目前一次一張,手動觸發)
-- 體驗打磨:升級特效、日夜氛圍、排行榜、音效
+| 類別 | 路由 |
+|---|---|
+| 公會 / 冒險者 | `GET /guilds`、`GET /adventurers/{id}`、`POST /adventurers/{id}/hide\|unhide\|identity\|abilities` |
+| 委託 | `GET/POST /commissions`、`PATCH/DELETE /commissions/{id}`、`POST /commissions/{id}/done\|reopen`、`GET /domains` |
+| 派遣 | `POST /commissions/{id}/dispatch\|enqueue\|steer\|stop`、`GET /commissions/{id}/events` |
+| 櫃台 | `GET/POST /reports`、`GET /reports/queue`、`POST /reports/polish`、`POST /reports/{id}/reject` |
+| 學習書架 | `GET /lessons`、`POST /lessons/reclassify` |
+| 戰報 / 成本 | `GET /report`、`GET /costs`、`GET /activity` |
+| 召回 | `POST /recall/ask`、`POST /recall/continue`、`GET /recall/stream` |
+| 訓練所 | `POST /training/propose\|distill`、`GET /proposals`、`POST /proposals/{id}/approve\|reject`、`GET/POST /evolutions` |
+| 夜巡 | `GET /muse/ideas\|config\|status`、`PUT /muse/config`、`POST /muse/run\|auto-run`、`POST /muse/ideas/{id}/promote\|dismiss` |
+| 上傳 | `POST /uploads`(base64 data URL → `/uploads/...`) |

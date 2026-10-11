@@ -12,15 +12,16 @@ stock-predictor 的大 session 可達數 MB,每次 API 呼叫都整檔重解析�
 
 from __future__ import annotations
 
-import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
+from . import config
+
 
 def _max_entries() -> int:
-    raw = os.environ.get("GUILD_CACHE_MAX", "512")
+    raw = config.get("GUILD_CACHE_MAX", "512")
     try:
         return int(raw)
     except ValueError:

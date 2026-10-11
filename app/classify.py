@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 
+from . import config
+
 log = logging.getLogger("guild.classify")
 
 CLAUDE = shutil.which("claude") or "claude"
-MODEL = os.environ.get("GUILD_CLASSIFY_MODEL", "claude-haiku-4-5-20251001")
-TIMEOUT = int(os.environ.get("GUILD_CLASSIFY_TIMEOUT", "120"))
+MODEL = config.get("GUILD_CLASSIFY_MODEL", "claude-haiku-4-5-20251001")
+TIMEOUT = int(config.get("GUILD_CLASSIFY_TIMEOUT", "120"))
 
 PROMPT = """你是學習書架的整理員。以下是一份教學卡,請做兩件事:
 1. category:把它歸到一個「廣義學習分類」(例如「財經學習」「程式學習」「語言學習」)。{cats_hint}

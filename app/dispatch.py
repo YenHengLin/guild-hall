@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import time
 
-from . import db, uploads
+from . import config, db, uploads
 from .claude_run import run_stream
 from .stream_recall import _summarize_tool
 
@@ -40,33 +40,33 @@ _STEP_ICON = {
 # Windows 程序「還沒跑起來就初始化失敗」的結束碼,通常是暫時性資源/環境問題,值得重試
 # 0xC0000142 STATUS_DLL_INIT_FAILED / 0xC0000005 存取違規 / 0xC0000017 記憶體不足
 _STARTUP_FAIL_CODES = {0xC0000142, 0xC0000005, 0xC0000017}
-_STARTUP_RETRIES = int(os.environ.get("GUILD_DISPATCH_STARTUP_RETRIES", "3"))
+_STARTUP_RETRIES = int(config.get("GUILD_DISPATCH_STARTUP_RETRIES", "3"))
 
 log = logging.getLogger("guild.dispatch")
 
 CLAUDE = shutil.which("claude") or "claude"
-MODEL = os.environ.get("GUILD_DISPATCH_MODEL", "")  # 空 = 用使用者預設模型
-MAX_ROUNDS = int(os.environ.get("GUILD_DISPATCH_ROUNDS", "6"))
+MODEL = config.get("GUILD_DISPATCH_MODEL", "")  # 空 = 用使用者預設模型
+MAX_ROUNDS = int(config.get("GUILD_DISPATCH_ROUNDS", "6"))
 # 閒置逾時:連續這麼久「毫無任何輸出」才視為 hang 砍掉(不是牆鐘硬上限)。
 # 只要冒險者還在吐工具動作/進度就持續延長 —— 真的在跑就不會被誤砍。
-ROUND_TIMEOUT = int(os.environ.get("GUILD_DISPATCH_TIMEOUT", "600"))
+ROUND_TIMEOUT = int(config.get("GUILD_DISPATCH_TIMEOUT", "600"))
 # 總時長絕對上限:防失控燒錢/無限迴圈。再怎麼「有在動」單回合也不超過這個。
-HARD_CAP = int(os.environ.get("GUILD_DISPATCH_HARD_CAP", "2400"))  # 預設 40 分
-MAX_TURNS = os.environ.get("GUILD_DISPATCH_TURNS", "25")  # claude 內部回合上限
-TOOLS = os.environ.get(
+HARD_CAP = int(config.get("GUILD_DISPATCH_HARD_CAP", "2400"))  # 預設 40 分
+MAX_TURNS = config.get("GUILD_DISPATCH_TURNS", "25")  # claude 內部回合上限
+TOOLS = config.get(
     "GUILD_DISPATCH_TOOLS", "Read,Glob,Grep,Edit,Write,Bash,WebSearch,WebFetch")
 
 # 櫃台驗收:DONE 時另起 claude 唯讀查驗產出是否達標,未過自動退回重做。
 # 預設用 sonnet:haiku 查得出「檔案在不在」,查不出「這修法根本沒解決問題」的深層錯誤
 # (真實案例:委託 #80 用弱模型驗收,把一個修錯根因的假修法蓋章放行)。
-ACCEPTANCE = os.environ.get("GUILD_ACCEPTANCE", "1") == "1"
-ACCEPT_MODEL = os.environ.get("GUILD_ACCEPT_MODEL", "claude-sonnet-4-6")
-MAX_REWORK = int(os.environ.get("GUILD_ACCEPTANCE_REWORK", "1"))  # 最多自動退回幾次
-ACCEPT_TIMEOUT = int(os.environ.get("GUILD_ACCEPT_TIMEOUT", "300"))
+ACCEPTANCE = config.get("GUILD_ACCEPTANCE", "1") == "1"
+ACCEPT_MODEL = config.get("GUILD_ACCEPT_MODEL", "claude-sonnet-4-6")
+MAX_REWORK = int(config.get("GUILD_ACCEPTANCE_REWORK", "1"))  # 最多自動退回幾次
+ACCEPT_TIMEOUT = int(config.get("GUILD_ACCEPT_TIMEOUT", "300"))
 
 # 自建任務資料夾的基底:並行派遣各用專屬子資料夾,避免同資料夾互卡。
 # 空 = 以委託指定的 cwd(或 home)為基底,在其下建 _tasks/<領域>/<標題-id>/。
-TASK_BASE = os.environ.get("GUILD_TASK_BASE", "")
+TASK_BASE = config.get("GUILD_TASK_BASE", "")
 
 
 def _slug(s: str) -> str:
@@ -108,7 +108,7 @@ def _folder_key(row) -> str:
 
 # 並行派遣:同時最多 PARALLEL 張(多個 headless Claude 吃 Windows 桌面堆,別開太多),
 # 且**同一資料夾同時只跑一張**(共用資料夾會互相改到檔案)—— 要並行就勾「自建資料夾」。
-PARALLEL = max(1, int(os.environ.get("GUILD_DISPATCH_PARALLEL", "2")))
+PARALLEL = max(1, int(config.get("GUILD_DISPATCH_PARALLEL", "2")))
 _running: dict[int, str] = {}  # 執行中委託 id → 資料夾 key
 
 # 派遣佇列:背景 worker 依 FIFO 抽取 status='queued' 的委託,有空位且資料夾沒被占就開跑。
@@ -963,7 +963,7 @@ def _task_memory_block(row) -> str:
                      f"{mem.strip()}\n")
     if _task_memory_on(row):
         parts.append("\n## 📌 記憶範圍\n本委託的記憶特化在任務內:"
-                     "**不要去讀寫全域 llm wiki**(如 D:\\myInfo),相關脈絡以上方任務記憶與目前資料夾為準。\n")
+                     "**不要去讀寫全域 llm wiki**,相關脈絡以上方任務記憶與目前資料夾為準。\n")
     return "".join(parts)
 
 

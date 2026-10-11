@@ -23,7 +23,7 @@ import shutil
 import threading
 from datetime import datetime, timezone
 
-from . import db, scanner
+from . import config, db, scanner
 from .claude_run import run_stream
 from .models import MuseConfig
 from .stream_recall import _summarize_tool
@@ -67,8 +67,8 @@ def get_progress() -> dict:
         return {**_progress, "steps": list(_progress["steps"])}
 
 CLAUDE = shutil.which("claude") or "claude"
-TIMEOUT = int(os.environ.get("GUILD_MUSE_TIMEOUT", "240"))
-MAX_TURNS = os.environ.get("GUILD_MUSE_TURNS", "14")
+TIMEOUT = int(config.get("GUILD_MUSE_TIMEOUT", "240"))
+MAX_TURNS = config.get("GUILD_MUSE_TURNS", "14")
 SETTING_KEY = "muse"
 _LAST_GUILD_KEY = "muse_last_guild"
 
